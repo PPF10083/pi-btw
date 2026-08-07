@@ -3,7 +3,8 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Registere
 import { visibleWidth } from "@earendil-works/pi-tui";
 import btwExtension from "../extensions/btw";
 
-const { promptStreamMock, createAgentSessionMock, sessionManagerInMemoryMock, subSessionRecords } = vi.hoisted(() => ({
+const { copyToClipboardMock, promptStreamMock, createAgentSessionMock, sessionManagerInMemoryMock, subSessionRecords } = vi.hoisted(() => ({
+  copyToClipboardMock: vi.fn(async (_text: string) => {}),
   promptStreamMock: vi.fn(),
   createAgentSessionMock: vi.fn(),
   sessionManagerInMemoryMock: vi.fn(() => ({ type: "in-memory-session" })),
@@ -22,6 +23,7 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
   const actual = await vi.importActual<typeof import("@earendil-works/pi-coding-agent")>("@earendil-works/pi-coding-agent");
   return {
     ...actual,
+    copyToClipboard: copyToClipboardMock,
     createAgentSession: createAgentSessionMock,
     SessionManager: {
       ...actual.SessionManager,
@@ -467,7 +469,14 @@ function createHarness(
   const sentUserMessages: Array<{ content: unknown; options?: unknown }> = [];
   const overlayHandles: FakeOverlayHandle[] = [];
   const overlays: Array<{ factoryOptions?: unknown; done?: (result: unknown) => void; component?: any }> = [];
-  const tui = { requestRender: vi.fn() };
+  const tui = {
+    requestRender: vi.fn(),
+    terminal: {
+      columns: 100,
+      rows: 30,
+      write: vi.fn(),
+    },
+  };
   const theme = options.theme ?? {
     fg: (_name: string, text: string) => text,
     bg: (_name: string, text: string) => text,
@@ -657,6 +666,7 @@ function createHarness(
     sentUserMessages,
     overlayHandles,
     overlays,
+    tui,
     baseCtx,
     mainSessionInputs,
     runSessionStart,
@@ -687,6 +697,8 @@ function createHarness(
 
 describe("btw runtime behavior", () => {
   beforeEach(() => {
+    copyToClipboardMock.mockReset();
+    copyToClipboardMock.mockResolvedValue(undefined);
     promptStreamMock.mockReset();
     createAgentSessionMock.mockReset();
     sessionManagerInMemoryMock.mockClear();
@@ -710,16 +722,32 @@ describe("btw runtime behavior", () => {
     const options = createAgentSessionMock.mock.calls[0][0];
     expect(options.model).toBe(harness.baseCtx.model);
     expect(options.modelRegistry).toBe(harness.baseCtx.modelRegistry);
+    expect(options.modelRuntime).toBeUndefined();
     expect(options.tools).toEqual(["read", "bash", "edit", "write"]);
     expect(options.resourceLoader.getAppendSystemPrompt()[0]).toContain(
       "You are having an aside conversation with the user, separate from their main working session.",
     );
+    expect(options.resourceLoader.getSystemPromptSource()).toBeUndefined();
+    expect(options.resourceLoader.getAppendSystemPromptSources()).toEqual([]);
 
     const subSession = subSessionRecords[0]?.session;
     expect(subSession).toBeDefined();
     expect(subSession.bindExtensions).not.toHaveBeenCalled();
     expect(subSession.getActiveToolNames()).toEqual(["read", "bash", "edit", "write"]);
     expect(subSession.prompt).toHaveBeenCalledWith("first question", { source: "extension" });
+  });
+
+  it("passes the canonical model runtime to Pi 0.83+ sub-sessions", async () => {
+    const harness = createHarness();
+    const modelRuntime = { kind: "model-runtime" };
+    (harness.baseCtx.modelRegistry as any).runtime = modelRuntime;
+
+    await harness.runSessionStart();
+    await harness.command("btw", "new runtime");
+
+    const options = createAgentSessionMock.mock.calls[0][0];
+    expect(options.modelRegistry).toBe(harness.baseCtx.modelRegistry);
+    expect(options.modelRuntime).toBe(modelRuntime);
   });
 
   it("uses BTW-specific model and thinking overrides for BTW prompts", async () => {
@@ -1451,18 +1479,21 @@ describe("btw runtime behavior", () => {
     const handle = harness.overlayHandles.at(-1);
     expect(handle?.isFocused()).toBe(true);
     expect(overlay.focused).toBe(true);
+    expect(harness.tui.terminal.write).toHaveBeenLastCalledWith("\x1b[?1002h\x1b[?1006h");
 
     overlay.handleInput("\u001b\u0017");
 
     expect(handle?.isFocused()).toBe(false);
     expect(handle?.isHidden()).toBe(false);
     expect(overlay.focused).toBe(false);
+    expect(harness.tui.terminal.write).toHaveBeenLastCalledWith("\x1b[?1002l\x1b[?1006l");
 
     await harness.shortcut("ctrl+alt+w");
 
     expect(handle?.isFocused()).toBe(true);
     expect(handle?.isHidden()).toBe(false);
     expect(overlay.focused).toBe(true);
+    expect(harness.tui.terminal.write).toHaveBeenLastCalledWith("\x1b[?1002h\x1b[?1006h");
   });
 
   it("marks the overlay input focused when BTW opens so the cursor stays in the composer", async () => {
@@ -1489,6 +1520,87 @@ describe("btw runtime behavior", () => {
     overlay.handleInput("abc");
 
     expect(inputHandleSpy).toHaveBeenCalledWith("abc");
+  });
+
+  it("selects and copies transcript text with forward, reverse, and wide-character mouse drags", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "select 中文 history");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.render(80);
+
+    overlay.handleInput("\x1b[<0;12;6M");
+    overlay.handleInput("\x1b[<0;12;6m");
+    await flushAsyncWork();
+    expect(copyToClipboardMock).not.toHaveBeenCalled();
+
+    overlay.handleInput("\x1b[<0;12;6M");
+    overlay.handleInput("\x1b[<32;22;6M");
+    expect(overlay.getSelectedTranscriptText()).toBe(" You  selec");
+    overlay.handleInput("\x1b[<0;22;6m");
+    await flushAsyncWork();
+    expect(copyToClipboardMock).toHaveBeenLastCalledWith(" You  selec");
+
+    overlay.handleInput("\x1b[<0;22;6M");
+    overlay.handleInput("\x1b[<32;12;6M");
+    expect(overlay.getSelectedTranscriptText()).toBe(" You  selec");
+
+    overlay.handleInput("\x1b[<0;26;6M");
+    overlay.handleInput("\x1b[<32;25;6M");
+    expect(overlay.getSelectedTranscriptText()).toBe("中");
+    overlay.handleInput("\x1b[<0;25;6m");
+    await flushAsyncWork();
+    expect(copyToClipboardMock).toHaveBeenLastCalledWith("中");
+    expect(overlay.hintsText.text).toContain("Copied 1 character");
+
+    overlay.handleInput("\x1b[<0;12;6M");
+    overlay.handleInput("\x1b[<0;12;6m");
+    expect(overlay.hintsText.text).not.toContain("Copied");
+  });
+
+  it("counts a copied emoji as one grapheme", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "select 😀 history");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.render(80);
+    overlay.handleInput("\x1b[<0;25;6M");
+    overlay.handleInput("\x1b[<32;26;6M");
+    expect(overlay.getSelectedTranscriptText()).toBe("😀");
+    overlay.handleInput("\x1b[<0;26;6m");
+    await flushAsyncWork();
+
+    expect(copyToClipboardMock).toHaveBeenLastCalledWith("😀");
+    expect(overlay.hintsText.text).toContain("Copied 1 character");
+  });
+
+  it("preserves wheel history scrolling and releases button tracking when the overlay closes", async () => {
+    const harness = createHarness();
+    const longAnswer = Array.from({ length: 40 }, (_, index) => `history line ${index + 1}`).join("\n");
+    promptStreamMock.mockImplementation(() => streamAnswer(longAnswer));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "long history");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.render(80);
+    const initialOffset = overlay.transcriptScrollOffset;
+    expect(initialOffset).toBeGreaterThan(0);
+    expect(harness.tui.terminal.write).toHaveBeenCalledWith("\x1b[?1002h\x1b[?1006h");
+
+    overlay.handleInput("\x1b[<64;20;10M");
+    overlay.render(80);
+    expect(overlay.transcriptScrollOffset).toBeLessThan(initialOffset);
+
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+    expect(harness.tui.terminal.write).toHaveBeenLastCalledWith("\x1b[?1002l\x1b[?1006l");
   });
 
   it("renders BTW as a bordered dialog with an internal transcript viewport", async () => {

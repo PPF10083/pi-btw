@@ -1,5 +1,8 @@
+import { stripVTControlCharacters } from "node:util";
+
 import {
   buildSessionContext,
+  copyToClipboard,
   createAgentSession,
   createExtensionRuntime,
   SessionManager,
@@ -55,6 +58,8 @@ const BTW_CONTINUE_THREAD_ASSISTANT_TEXT = "Understood, continuing our side conv
 type SessionThinkingLevel = "off" | AiThinkingLevel;
 type BtwThreadMode = "contextual" | "tangent";
 type SessionModel = NonNullable<ExtensionCommandContext["model"]>;
+type CreateSessionOptions = Exclude<Parameters<typeof createAgentSession>[0], undefined>;
+type ModelRegistryWithRuntime = { readonly runtime?: unknown };
 /**
  * Loose model reference parsed from `/btw:model <provider> <id> <api>` and persisted to
  * session entries. Resolved to a full SessionModel via ctx.modelRegistry.find(...).
@@ -129,6 +134,20 @@ type BtwTranscriptEntry =
 
 type BtwTranscript = BtwTranscriptEntry[];
 
+type BtwMouseEvent = {
+  button: number;
+  x: number;
+  y: number;
+  action: "press" | "release";
+  motion: boolean;
+  wheelDelta: number | null;
+};
+
+type BtwTranscriptSelectionPoint = {
+  line: number;
+  column: number;
+};
+
 type BtwTranscriptState = {
   entries: BtwTranscript;
   nextEntryId: number;
@@ -176,17 +195,31 @@ function createBtwResourceLoader(
   const extensionsResult = { extensions: [], errors: [], runtime: createExtensionRuntime() };
   const systemPrompt = stripDynamicSystemPromptFooter(ctx.getSystemPrompt());
 
-  return {
+  const resourceLoader = {
     getExtensions: () => extensionsResult,
     getSkills: () => ({ skills: [], diagnostics: [] }),
     getPrompts: () => ({ prompts: [], diagnostics: [] }),
     getThemes: () => ({ themes: [], diagnostics: [] }),
     getAgentsFiles: () => ({ agentsFiles: [] }),
     getSystemPrompt: () => systemPrompt,
+    getSystemPromptSource: () => undefined,
     getAppendSystemPrompt: () => appendSystemPrompt,
+    getAppendSystemPromptSources: () => [],
     extendResources: () => {},
     reload: async () => {},
   };
+
+  return resourceLoader as ResourceLoader;
+}
+
+function getSessionModelOptions(ctx: ExtensionCommandContext): {
+  modelRegistry: ExtensionCommandContext["modelRegistry"];
+  modelRuntime?: unknown;
+} {
+  const modelRegistry = ctx.modelRegistry;
+  // Pi 0.83+ keeps the canonical ModelRuntime behind the ModelRegistry compatibility facade.
+  const modelRuntime = (modelRegistry as unknown as ModelRegistryWithRuntime).runtime;
+  return modelRuntime ? { modelRegistry, modelRuntime } : { modelRegistry };
 }
 
 function extractText(parts: AssistantMessage["content"], type: "text" | "thinking"): string {
@@ -1003,6 +1036,79 @@ function notify(ctx: ExtensionContext | ExtensionCommandContext, message: string
 
 /** Fixed overlay rows outside the transcript viewport (must match render() structure). */
 const BTW_OVERLAY_CHROME_LINES = 9;
+const BTW_TRANSCRIPT_START_ROW = 4;
+const BTW_OVERLAY_TOP_MARGIN = 1;
+const BTW_GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+function extractTerminalControlSequence(value: string, index: number): string | null {
+  if (value[index] !== "\x1b") {
+    return null;
+  }
+
+  const remainder = value.slice(index);
+  return (
+    remainder.match(/^\x1b\[[0-?]*[ -/]*[@-~]/)?.[0] ??
+    remainder.match(/^\x1b\][^\x07]*(?:\x07|\x1b\\)/)?.[0] ??
+    null
+  );
+}
+
+function countGraphemes(value: string): number {
+  let count = 0;
+  for (const _segment of BTW_GRAPHEME_SEGMENTER.segment(value)) {
+    count++;
+  }
+  return count;
+}
+
+function sliceByTerminalColumns(value: string, startColumn: number, length: number): string {
+  if (length <= 0) {
+    return "";
+  }
+
+  const endColumn = startColumn + length;
+  let result = "";
+  let currentColumn = 0;
+  let index = 0;
+  let pendingControlSequences = "";
+
+  while (index < value.length && currentColumn < endColumn) {
+    const controlSequence = extractTerminalControlSequence(value, index);
+    if (controlSequence) {
+      if (currentColumn >= startColumn) {
+        result += controlSequence;
+      } else {
+        pendingControlSequences += controlSequence;
+      }
+      index += controlSequence.length;
+      continue;
+    }
+
+    let textEnd = index;
+    while (textEnd < value.length && !extractTerminalControlSequence(value, textEnd)) {
+      textEnd++;
+    }
+
+    for (const { segment } of BTW_GRAPHEME_SEGMENTER.segment(value.slice(index, textEnd))) {
+      const segmentWidth = visibleWidth(segment);
+      const inRange = currentColumn >= startColumn && currentColumn < endColumn;
+      if (inRange && currentColumn + segmentWidth <= endColumn) {
+        if (pendingControlSequences) {
+          result += pendingControlSequences;
+          pendingControlSequences = "";
+        }
+        result += segment;
+      }
+      currentColumn += segmentWidth;
+      if (currentColumn >= endColumn) {
+        break;
+      }
+    }
+    index = textEnd;
+  }
+
+  return result;
+}
 
 function getOverlayTitle(mode: BtwThreadMode): string {
   return mode === "tangent" ? "BTW tangent" : "BTW";
@@ -1036,6 +1142,16 @@ class BtwOverlayComponent extends Container implements Focusable {
   private transcriptScrollOffset = 0;
   private transcriptViewportHeight = 8;
   private followTranscript = true;
+  private renderedTranscriptLines: string[] = [];
+  private renderedTranscriptPlainLines: string[] = [];
+  private renderedTranscriptInnerWidth = 0;
+  private renderedDialogWidth = 0;
+  private selectionAnchor: BtwTranscriptSelectionPoint | null = null;
+  private selectionFocus: BtwTranscriptSelectionPoint | null = null;
+  private selectionMoved = false;
+  private selectionNotice: string | null = null;
+  private selectionCopyGeneration = 0;
+  private mouseTrackingEnabled = false;
   private _focused = false;
   private modeTextValue = "";
   private summaryTextValue = "";
@@ -1049,6 +1165,7 @@ class BtwOverlayComponent extends Container implements Focusable {
   set focused(value: boolean) {
     this._focused = value;
     this.input.focused = value;
+    this.setMouseTrackingEnabled(value);
   }
 
   constructor(
@@ -1087,9 +1204,6 @@ class BtwOverlayComponent extends Container implements Focusable {
     };
 
     this.hintsText = new Text("", 1, 0);
-
-    // Enable SGR mouse reporting so wheel/touchpad events reach handleInput().
-    this.tui.terminal?.write?.("\x1b[?1000h\x1b[?1006h");
 
     const originalHandleInput = this.input.handleInput.bind(this.input);
     this.input.handleInput = (data: string) => {
@@ -1156,21 +1270,281 @@ class BtwOverlayComponent extends Container implements Focusable {
   }
 
   dispose(): void {
-    this.tui.terminal?.write?.("\x1b[?1000l\x1b[?1006l");
+    this.selectionCopyGeneration++;
+    this.setMouseTrackingEnabled(false);
   }
 
-  private getMouseScrollDelta(data: string): number | null {
-    const match = data.match(/^\x1b\[<(\d+);\d+;\d+[Mm]$/);
+  private setMouseTrackingEnabled(enabled: boolean): void {
+    if (this.mouseTrackingEnabled === enabled) {
+      return;
+    }
+
+    this.mouseTrackingEnabled = enabled;
+    // Button-event tracking preserves wheel input and also reports left-button drag motion.
+    this.tui.terminal?.write?.(enabled ? "\x1b[?1002h\x1b[?1006h" : "\x1b[?1002l\x1b[?1006l");
+  }
+
+  private parseMouseEvent(data: string): BtwMouseEvent | null {
+    const match = data.match(/^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/);
     if (!match) {
       return null;
     }
 
     const button = Number(match[1]);
-    if ((button & 64) !== 64) {
+    const wheelDelta = (button & 64) === 64 ? ((button & 1) === 0 ? -3 : 3) : null;
+
+    return {
+      button,
+      x: Number(match[2]),
+      y: Number(match[3]),
+      action: match[4] === "m" ? "release" : "press",
+      motion: (button & 32) === 32,
+      wheelDelta,
+    };
+  }
+
+  private getOverlayOrigin(): { row: number; column: number } {
+    const terminalWidth = this.tui.terminal?.columns ?? process.stdout.columns ?? this.renderedDialogWidth;
+    return {
+      row: BTW_OVERLAY_TOP_MARGIN,
+      column: Math.max(0, Math.floor((terminalWidth - this.renderedDialogWidth) / 2)),
+    };
+  }
+
+  private getTranscriptSelectionPoint(
+    event: BtwMouseEvent,
+    clampToViewport: boolean,
+  ): BtwTranscriptSelectionPoint | null {
+    if (this.renderedTranscriptLines.length === 0 || this.renderedDialogWidth === 0) {
       return null;
     }
 
-    return (button & 1) === 0 ? -3 : 3;
+    const origin = this.getOverlayOrigin();
+    const localRow = event.y - 1 - origin.row;
+    const localColumn = event.x - 1 - origin.column;
+    const transcriptRow = localRow - BTW_TRANSCRIPT_START_ROW;
+    const contentColumn = localColumn - 1;
+    const firstVisibleLine = this.transcriptScrollOffset;
+    const lastVisibleLine = Math.min(
+      this.renderedTranscriptLines.length - 1,
+      firstVisibleLine + this.transcriptViewportHeight - 1,
+    );
+
+    if (lastVisibleLine < firstVisibleLine) {
+      return null;
+    }
+
+    if (
+      !clampToViewport &&
+      (transcriptRow < 0 ||
+        transcriptRow >= this.transcriptViewportHeight ||
+        contentColumn < 0 ||
+        contentColumn >= this.renderedTranscriptInnerWidth)
+    ) {
+      return null;
+    }
+
+    const clampedTranscriptRow = Math.max(0, Math.min(transcriptRow, this.transcriptViewportHeight - 1));
+    const line = Math.max(firstVisibleLine, Math.min(firstVisibleLine + clampedTranscriptRow, lastVisibleLine));
+    const lineWidth = visibleWidth(this.renderedTranscriptPlainLines[line] ?? "");
+    const clampedContentColumn = Math.max(0, Math.min(contentColumn, this.renderedTranscriptInnerWidth - 1));
+
+    return {
+      line,
+      column: Math.min(clampedContentColumn, lineWidth),
+    };
+  }
+
+  private compareSelectionPoints(a: BtwTranscriptSelectionPoint, b: BtwTranscriptSelectionPoint): number {
+    return a.line === b.line ? a.column - b.column : a.line - b.line;
+  }
+
+  private getOrderedSelection():
+    | { start: BtwTranscriptSelectionPoint; end: BtwTranscriptSelectionPoint }
+    | null {
+    if (!this.selectionMoved || !this.selectionAnchor || !this.selectionFocus) {
+      return null;
+    }
+
+    return this.compareSelectionPoints(this.selectionAnchor, this.selectionFocus) <= 0
+      ? { start: this.selectionAnchor, end: this.selectionFocus }
+      : { start: this.selectionFocus, end: this.selectionAnchor };
+  }
+
+  private getGraphemeColumnRange(text: string, targetColumn: number): { start: number; end: number } {
+    let column = 0;
+    for (const { segment } of BTW_GRAPHEME_SEGMENTER.segment(text)) {
+      const segmentWidth = visibleWidth(segment);
+      if (segmentWidth === 0) {
+        continue;
+      }
+
+      const end = column + segmentWidth;
+      if (targetColumn < end) {
+        return { start: column, end };
+      }
+      column = end;
+    }
+
+    return { start: column, end: column };
+  }
+
+  private getSelectionColumnsForLine(
+    lineIndex: number,
+    line: string,
+  ): { start: number; end: number } | null {
+    const selection = this.getOrderedSelection();
+    if (!selection || lineIndex < selection.start.line || lineIndex > selection.end.line) {
+      return null;
+    }
+
+    const lineWidth = visibleWidth(line);
+    const start =
+      lineIndex === selection.start.line
+        ? this.getGraphemeColumnRange(line, Math.min(selection.start.column, lineWidth)).start
+        : 0;
+    const end =
+      lineIndex === selection.end.line
+        ? this.getGraphemeColumnRange(line, Math.min(selection.end.column, lineWidth)).end
+        : lineWidth;
+    return end > start ? { start, end } : null;
+  }
+
+  private highlightTranscriptSelection(line: string, lineIndex: number): string {
+    const lineWidth = visibleWidth(line);
+    const plainLine = this.renderedTranscriptPlainLines[lineIndex] ?? "";
+    const columns = this.getSelectionColumnsForLine(lineIndex, plainLine);
+    if (!columns) {
+      return line;
+    }
+
+    const before = sliceByTerminalColumns(line, 0, columns.start);
+    const selected = sliceByTerminalColumns(plainLine, columns.start, columns.end - columns.start);
+    const after = sliceByTerminalColumns(line, columns.end, Math.max(0, lineWidth - columns.end));
+    const highlighted = this.theme.bg("selectedBg", this.theme.fg("text", selected));
+    return `${before}${highlighted}${after}`;
+  }
+
+  private getSelectedTranscriptText(): string {
+    const selection = this.getOrderedSelection();
+    if (!selection) {
+      return "";
+    }
+
+    const selectedLines: string[] = [];
+    for (let lineIndex = selection.start.line; lineIndex <= selection.end.line; lineIndex++) {
+      const line = this.renderedTranscriptPlainLines[lineIndex] ?? "";
+      const columns = this.getSelectionColumnsForLine(lineIndex, line);
+      selectedLines.push(
+        columns ? sliceByTerminalColumns(line, columns.start, columns.end - columns.start) : "",
+      );
+    }
+    return selectedLines.join("\n");
+  }
+
+  private clearTranscriptSelection(clearNotice = true): void {
+    this.selectionAnchor = null;
+    this.selectionFocus = null;
+    this.selectionMoved = false;
+    if (clearNotice) {
+      const hadNotice = this.selectionNotice !== null;
+      this.selectionNotice = null;
+      this.selectionCopyGeneration++;
+      if (hadNotice) {
+        this.updateHints(false);
+      }
+    }
+  }
+
+  private buildHintsText(): string {
+    const controls = "Drag select/copy · Wheel ↑↓ PgUp/PgDn · Enter · Alt+/ focus · Esc";
+    return this.selectionNotice ? `${this.selectionNotice} · ${controls}` : controls;
+  }
+
+  private updateHints(requestRender = true): void {
+    this.hintsTextValue = this.buildHintsText();
+    this.hintsText.setText(this.hintsTextValue);
+    if (requestRender) {
+      this.tui.requestRender();
+    }
+  }
+
+  private copyTranscriptSelection(): void {
+    const text = this.getSelectedTranscriptText();
+    if (!text) {
+      this.clearTranscriptSelection();
+      return;
+    }
+
+    const generation = ++this.selectionCopyGeneration;
+    this.selectionNotice = "Copying selection...";
+    this.updateHints();
+
+    void copyToClipboard(text)
+      .then(() => {
+        if (generation !== this.selectionCopyGeneration) {
+          return;
+        }
+        const characterCount = countGraphemes(text);
+        this.selectionNotice = `Copied ${characterCount} character${characterCount === 1 ? "" : "s"}`;
+        this.updateHints();
+      })
+      .catch(() => {
+        if (generation !== this.selectionCopyGeneration) {
+          return;
+        }
+        this.selectionNotice = "Could not copy selection";
+        this.updateHints();
+      });
+  }
+
+  private handleMouseEvent(event: BtwMouseEvent): void {
+    if (event.wheelDelta !== null) {
+      this.scrollTranscript(event.wheelDelta);
+      return;
+    }
+
+    const baseButton = event.button & 3;
+    if (event.action === "press" && !event.motion && baseButton === 0) {
+      const point = this.getTranscriptSelectionPoint(event, false);
+      if (!point) {
+        return;
+      }
+
+      this.clearTranscriptSelection();
+      this.followTranscript = false;
+      this.selectionAnchor = point;
+      this.selectionFocus = point;
+      this.tui.requestRender();
+      return;
+    }
+
+    if (event.action === "press" && event.motion && baseButton === 0 && this.selectionAnchor) {
+      const point = this.getTranscriptSelectionPoint(event, true);
+      if (!point) {
+        return;
+      }
+
+      this.selectionFocus = point;
+      this.selectionMoved = this.compareSelectionPoints(this.selectionAnchor, point) !== 0;
+      this.tui.requestRender();
+      return;
+    }
+
+    if (event.action === "release" && this.selectionAnchor) {
+      const point = this.getTranscriptSelectionPoint(event, true);
+      if (point) {
+        this.selectionFocus = point;
+        this.selectionMoved = this.selectionMoved || this.compareSelectionPoints(this.selectionAnchor, point) !== 0;
+      }
+
+      if (this.selectionMoved) {
+        this.copyTranscriptSelection();
+      } else {
+        this.clearTranscriptSelection();
+      }
+      this.tui.requestRender();
+    }
   }
 
   handleInput(data: string): void {
@@ -1179,9 +1553,9 @@ class BtwOverlayComponent extends Container implements Focusable {
       return;
     }
 
-    const mouseScrollDelta = this.getMouseScrollDelta(data);
-    if (mouseScrollDelta !== null) {
-      this.scrollTranscript(mouseScrollDelta);
+    const mouseEvent = this.parseMouseEvent(data);
+    if (mouseEvent) {
+      this.handleMouseEvent(mouseEvent);
       return;
     }
 
@@ -1226,6 +1600,13 @@ class BtwOverlayComponent extends Container implements Focusable {
     const dialogWidth = Math.max(24, width);
     const innerWidth = Math.max(22, dialogWidth - 2);
     const transcriptLines = this.wrapTranscript(innerWidth);
+    if (this.renderedTranscriptInnerWidth !== 0 && this.renderedTranscriptInnerWidth !== innerWidth) {
+      this.clearTranscriptSelection();
+    }
+    this.renderedDialogWidth = dialogWidth;
+    this.renderedTranscriptInnerWidth = innerWidth;
+    this.renderedTranscriptLines = transcriptLines;
+    this.renderedTranscriptPlainLines = transcriptLines.map((line) => stripVTControlCharacters(line));
     const dialogHeight = this.getDialogHeight();
     const chromeHeight = BTW_OVERLAY_CHROME_LINES;
     const transcriptHeight = Math.max(6, dialogHeight - chromeHeight);
@@ -1259,8 +1640,9 @@ class BtwOverlayComponent extends Container implements Focusable {
     lines.push(this.frameLine(this.theme.fg("dim", summary), innerWidth));
     lines.push(this.ruleLine(innerWidth));
 
-    for (const line of visibleTranscript) {
-      lines.push(this.frameLine(line, innerWidth));
+    for (let i = 0; i < visibleTranscript.length; i++) {
+      const lineIndex = this.transcriptScrollOffset + i;
+      lines.push(this.frameLine(this.highlightTranscriptSelection(visibleTranscript[i], lineIndex), innerWidth));
     }
     for (let i = 0; i < transcriptPadCount; i++) {
       lines.push(this.frameLine("", innerWidth));
@@ -1292,6 +1674,9 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.modeTextValue = `${getOverlayTitle(this.getMode())} · hidden thread preserved`;
     this.modeText.setText(this.modeTextValue);
     const entries = this.readTranscriptEntries();
+    if (entries.length === 0) {
+      this.clearTranscriptSelection();
+    }
     const exchanges = getCompletedExchangeCount(entries);
     const active = hasStreamingTranscriptEntry(entries) ? " · streaming" : " · idle";
     this.summaryTextValue = `${exchanges} exchange${exchanges === 1 ? "" : "s"}${active}`;
@@ -1306,7 +1691,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     const status = this.getStatus() ?? "Ready. Enter submits; Escape dismisses without clearing.";
     this.statusTextValue = status;
     this.statusText.setText(this.statusTextValue);
-    this.hintsTextValue = "Scroll wheel ↑↓ PgUp/PgDn · Enter · Alt+/ focus · Esc";
+    this.hintsTextValue = this.buildHintsText();
     this.hintsText.setText(this.hintsTextValue);
     this.tui.requestRender();
   }
@@ -1597,15 +1982,16 @@ export default function (pi: ExtensionAPI) {
       throw new Error(settings.fallbackReason || "No active model selected.");
     }
 
-    const { session } = await createAgentSession({
+    const sessionOptions = {
       sessionManager: SessionManager.inMemory(),
       model: settings.model,
-      modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
+      ...getSessionModelOptions(ctx),
       thinkingLevel: settings.thinkingLevel,
       // Match pi's default coding-agent toolset (read/bash/edit/write).
       tools: ["read", "bash", "edit", "write"],
       resourceLoader: createBtwResourceLoader(ctx),
-    });
+    } as CreateSessionOptions;
+    const { session } = await createAgentSession(sessionOptions);
 
     const { messages: seedMessages, sideThreadStartIndex } = buildBtwSeedState(ctx, pendingThread, mode, settings.model);
     if (seedMessages.length > 0) {
@@ -2153,14 +2539,15 @@ export default function (pi: ExtensionAPI) {
       throw new Error(auth.ok ? `No credentials available for ${model.provider}/${model.id}.` : auth.error);
     }
 
-    const { session } = await createAgentSession({
+    const sessionOptions = {
       sessionManager: SessionManager.inMemory(),
       model,
-      modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
+      ...getSessionModelOptions(ctx),
       thinkingLevel: "off",
       tools: [],
       resourceLoader: createBtwResourceLoader(ctx, [BTW_SUMMARIZE_SYSTEM_PROMPT]),
-    });
+    } as CreateSessionOptions;
+    const { session } = await createAgentSession(sessionOptions);
 
     try {
       await session.prompt(formatThread(thread), { source: "extension" });

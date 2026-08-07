@@ -1,6 +1,6 @@
-# pi-btw
+# @ppf10083/pi-btw
 
-A small [pi](https://github.com/earendil-works/pi-mono) extension that adds a `/btw` side conversation channel.
+A maintained fork of [pi-btw](https://github.com/dbachelder/pi-btw) that adds mouse-selectable BTW transcripts while preserving the original side-conversation workflow.
 
 `/btw` opens a real pi sub-session with coding-tool access, and it runs immediately even while the main agent is still busy.
 
@@ -12,7 +12,8 @@ A small [pi](https://github.com/earendil-works/pi-mono) extension that adds a `/
 - runs that side conversation as a real pi sub-session with `read` / `bash` / `edit` / `write` tool access
 - keeps a continuous BTW thread by default
 - supports `/btw:tangent` for a contextless side thread that does not inherit the current main-session conversation
-- opens a focused BTW modal shell with its own composer and transcript
+- opens or refreshes a focused BTW modal shell with its own composer and transcript
+- supports mouse drag selection in the transcript and copies the selection on release
 - keeps the BTW overlay open while you switch focus back to the main editor with `Alt+/`
 - keeps BTW thread entries out of the main agent's future context
 - supports BTW-only model and thinking overrides without changing the main thread settings
@@ -24,13 +25,7 @@ A small [pi](https://github.com/earendil-works/pi-mono) extension that adds a `/
 ### From npm (after publish)
 
 ```bash
-pi install npm:pi-btw
-```
-
-### From git
-
-```bash
-pi install git:github.com/dbachelder/pi-btw
+pi install npm:@ppf10083/pi-btw
 ```
 
 Then reload pi:
@@ -75,6 +70,8 @@ pi install /absolute/path/to/pi-btw
 
 ## Overlay controls
 
+- drag with the left mouse button in the transcript to select text; releasing copies it to the clipboard
+- the mouse wheel and touchpad continue to scroll transcript history
 - `Alt+/` toggles focus between BTW and the main editor without closing the overlay
 - `Ctrl+Alt+W` is a fallback focus toggle for terminals that do not deliver `Alt+/` as a usable shortcut
 - `Esc` still dismisses BTW immediately while the overlay is focused
@@ -200,4 +197,4 @@ pi -e /path/to/pi-btw
 
 ## License
 
-MIT
+MIT. Based on [dbachelder/pi-btw](https://github.com/dbachelder/pi-btw); the original copyright notice is retained in `LICENSE`.
