@@ -4,7 +4,15 @@
   "description": "A pi extension for parallel side conversations with mouse-selectable transcripts",
   "type": "module",
   "license": "MIT",
-  "author": "PPF",
+  "author": "PPF10083",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PPF10083/pi-btw.git"
+  },
+  "homepage": "https://github.com/PPF10083/pi-btw#readme",
+  "bugs": {
+    "url": "https://github.com/PPF10083/pi-btw/issues"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -33,7 +41,8 @@
     ],
     "skills": [
       "./skills"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/PPF10083/pi-btw/main/docs/btw-overlay.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.74.0 <1",
