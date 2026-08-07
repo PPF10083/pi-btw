@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, RegisteredCommand } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, visibleWidth } from "@earendil-works/pi-tui";
 import btwExtension from "../extensions/btw";
 
 const { copyToClipboardMock, promptStreamMock, createAgentSessionMock, sessionManagerInMemoryMock, subSessionRecords } = vi.hoisted(() => ({
@@ -87,7 +87,8 @@ const tuiMocks = vi.hoisted(() => {
       return this.value;
     }
     render(_width: number) {
-      return [`> ${this.value}`];
+      const cursorMarker = this.focused ? CURSOR_MARKER : "";
+      return [`> ${this.value}${cursorMarker}`];
     }
     handleInput(_data: string) {}
   }
@@ -1508,6 +1509,28 @@ describe("btw runtime behavior", () => {
     expect(overlay.input.focused).toBe(true);
   });
 
+  it("keeps the hardware cursor marker beside Chinese input for IME placement", async () => {
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.setDraft("测试中文输入");
+    const focusedInputLine = (overlay.render(80) as string[]).at(-3) ?? "";
+    const markerIndex = focusedInputLine.indexOf(CURSOR_MARKER);
+
+    expect(markerIndex).toBeGreaterThan(0);
+    expect(visibleWidth(focusedInputLine.slice(0, markerIndex))).toBeGreaterThan(1);
+    expect(visibleWidth(focusedInputLine)).toBe(80);
+    expect(focusedInputLine.endsWith("│")).toBe(true);
+
+    overlay.focused = false;
+    const unfocusedInputLine = (overlay.render(80) as string[]).at(-3) ?? "";
+    expect(unfocusedInputLine).not.toContain(CURSOR_MARKER);
+    expect(visibleWidth(unfocusedInputLine)).toBe(80);
+  });
+
   it("forwards terminal input from the focused overlay to the embedded BTW input", async () => {
     const harness = createHarness();
 
@@ -1663,7 +1686,7 @@ describe("btw runtime behavior", () => {
     expect(emptyStateLine).not.toContain("<fg:border>│</fg:border> <fg:dim>No BTW thread yet.");
     expect(assistantBodyLine).toContain("<fg:border>│</fg:border>    First answer");
     expect(inputLine).toContain("<fg:border>│</fg:border>> ");
-    expect(inputLine).not.toContain("\x1b_pi:c\x07");
+    expect(inputLine).toContain(CURSOR_MARKER);
   });
 
   it("/btw:new appends a reset marker, disposes the old sub-session, clears prior hidden thread state, stays contextual, and reopens a fresh thread", async () => {

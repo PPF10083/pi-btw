@@ -1576,20 +1576,12 @@ class BtwOverlayComponent extends Container implements Focusable {
 
   private inputFrameLine(dialogWidth: number): string {
     const targetWidth = Math.max(1, dialogWidth - 2);
-    const previousFocused = this.input.focused;
-    // Input.render() emits CURSOR_MARKER when focused. In overlay mode that APC marker
-    // can skew width/composition on this one row before the TUI strips it, producing a
-    // right-edge notch and shifted border. Render the embedded input unfocused here so
-    // the row stays geometrically stable while the overlay still owns keyboard input.
-    this.input.focused = false;
-    try {
-      const renderedInputLine = this.input.render(targetWidth)[0] ?? "";
-      const inputLine = truncateToWidth(renderedInputLine, targetWidth, "");
-      const padding = Math.max(0, targetWidth - visibleWidth(inputLine));
-      return `${this.theme.fg("border", "│")}${inputLine}${" ".repeat(padding)}${this.theme.fg("border", "│")}`;
-    } finally {
-      this.input.focused = previousFocused;
-    }
+    // Preserve Input's zero-width CURSOR_MARKER so the TUI can position the
+    // terminal's hardware cursor, which anchors IME candidate windows.
+    const renderedInputLine = this.input.render(targetWidth)[0] ?? "";
+    const inputLine = truncateToWidth(renderedInputLine, targetWidth, "");
+    const padding = Math.max(0, targetWidth - visibleWidth(inputLine));
+    return `${this.theme.fg("border", "│")}${inputLine}${" ".repeat(padding)}${this.theme.fg("border", "│")}`;
   }
 
   private fitRenderedLine(line: string, width: number): string {
