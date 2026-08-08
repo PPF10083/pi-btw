@@ -15,7 +15,7 @@ A maintained fork of [pi-btw](https://github.com/dbachelder/pi-btw) that adds mo
 - opens or refreshes a focused BTW modal shell with its own composer and transcript
 - supports mouse drag selection in the transcript and copies the selection on release
 - renders assistant replies, thinking blocks, and saved notes as markdown (headings, bold, lists, code blocks, tables, and `---` rules) instead of raw syntax
-- keeps the BTW overlay open while you switch focus back to the main editor with `Alt+/`
+- hides/shows the BTW panel with `Ctrl+/` so the main session is not covered
 - keeps BTW thread entries out of the main agent's future context
 - supports BTW-only model and thinking overrides without changing the main thread settings
 - lets you inject the full thread, or a summary of it, back into the main agent
@@ -73,13 +73,18 @@ pi install /absolute/path/to/pi-btw
 
 ## Overlay controls
 
-- drag with the left mouse button in the transcript to select text; releasing copies it to the clipboard
-- the mouse wheel and touchpad continue to scroll transcript history
-- `Alt+/` toggles the BTW panel visibility: it hides the panel (focus returns to the main editor so the main session is no longer covered), and pressing it again brings the panel back with focus restored
-- `Ctrl+Alt+W` is a fallback focus toggle for terminals that do not deliver `Alt+/` as a usable shortcut
-- `Esc Esc` (double Escape) rewinds the last exchange: it aborts an in-flight request, or removes the last completed exchange from the thread (persisted across reloads, repeatable)
-- a single `Esc` shows a hint and does nothing destructive, so it cannot be triggered by accident
-- `Ctrl+C` clears a non-empty composer, or dismisses BTW when the composer is empty (the thread is preserved)
+- `Esc` / `Ctrl+C` are context-aware:
+  - with text in the composer, they clear the input
+  - with an empty composer while the LLM is running, they abort the request (the panel stays open)
+  - with an empty composer and an idle LLM, they dismiss BTW (the thread is preserved)
+- `Esc Esc` (double Escape) rewinds the last exchange: while the LLM is running it aborts the
+  request; otherwise it removes the most recent message from the thread (persisted across
+  reloads; repeat to keep unwinding)
+- the mouse wheel and touchpad continue to scroll transcript history; dragging with the left
+  mouse button selects a range and copies it to the clipboard on release
+- `Ctrl+/` toggles the BTW panel visibility: it hides the panel (focus returns to the main editor
+  so the main session is no longer covered), and pressing it again brings the panel back with focus restored
+- `Ctrl+Alt+W` is a fallback visibility toggle for terminals that do not deliver `Ctrl+/` as a usable shortcut
 - BTW now opens top-centered so the main session remains visible underneath it
 
 ### `/btw:new [question]`

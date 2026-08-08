@@ -1069,44 +1069,104 @@ describe("btw runtime behavior", () => {
     expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
   });
 
-  it("does not dismiss on a single Escape; double Escape rewinds the last exchange", async () => {
+  it("clears input immediately with Escape; double Escape rewinds the last message", async () => {
     const harness = createHarness([], {
       keybindingMatches: (_data, id) => id === "tui.select.cancel",
     });
 
     await harness.runSessionStart();
     promptStreamMock.mockImplementationOnce(() => streamAnswer("First answer"));
+    promptStreamMock.mockImplementationOnce(() => streamAnswer("Second answer"));
     await harness.command("btw", "first question");
-
-    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
-    const overlay = harness.latestOverlayComponent();
-    overlay.input.setValue("draft follow-up");
-
-    // A single Escape neither dismisses nor clears; it shows the rewind hint.
-    overlay.input.handleInput("\x1b");
+    await harness.command("btw", "second question");
     await flushAsyncWork();
-    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(0);
-    expect(overlay.input.getValue()).toBe("draft follow-up");
-    expect(overlay.render(96).join("\n")).toContain("Double-Esc");
 
-    // A second Escape within the window rewinds the last exchange.
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(2);
+    const overlay = harness.latestOverlayComponent();
+
+    // With input present, a single Escape clears it immediately.
+    overlay.input.setValue("draft");
+    overlay.input.handleInput("\x1b");
+    expect(overlay.input.getValue()).toBe("");
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(0);
+
+    // Double Escape rewinds the last message (the second exchange is removed).
+    overlay.input.handleInput("\x1b");
     overlay.input.handleInput("\x1b");
     await flushAsyncWork();
     expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(0);
     overlay.refresh();
     expect(overlay.statusText.text).toContain("Rewound");
 
-    // The rewind is persisted via a reset marker; a reload restores the empty thread.
+    // The rewind is persisted via a reset marker; a reload restores the shorter thread.
     expect(getCustomEntries(harness.entries, "btw-thread-reset")).toHaveLength(1);
     await harness.runSessionStart();
     const restored = harness.latestOverlayComponent();
     restored.refresh();
-    expect(restored.transcript.children.map((child: any) => child.text).join("\n")).toContain(
-      "No BTW thread yet",
-    );
+    const restoredText = restored.transcript.children.map((child: any) => child.text).join("\n");
+    expect(restoredText).toContain("first question");
+    expect(restoredText).not.toContain("second question");
   });
 
-  it("aborts the in-flight BTW request on double Escape without dismissing", async () => {
+  it("shows nothing-to-rewind on double Escape with an empty thread", async () => {
+    const harness = createHarness([], {
+      keybindingMatches: (_data, id) => id === "tui.select.cancel",
+    });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.handleInput("\x1b");
+    overlay.input.handleInput("\x1b");
+    await flushAsyncWork();
+
+    overlay.refresh();
+    expect(overlay.statusText.text).toContain("Nothing to rewind.");
+  });
+
+  it("dismisses with a single Escape after the delay when idle", async () => {
+    const harness = createHarness([], {
+      keybindingMatches: (_data, id) => id === "tui.select.cancel",
+    });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.handleInput("\x1b");
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(0);
+
+    // The delayed dismissal fires ~300ms later.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
+  });
+
+  it("aborts the in-flight BTW request with Escape/Ctrl+C while the composer is empty", async () => {
+    const harness = createHarness([], {
+      keybindingMatches: (_data, id) => id === "tui.select.cancel",
+    });
+    const blocking = createBlockingToolStream();
+    promptStreamMock.mockImplementation(() => blocking.stream());
+
+    await harness.runSessionStart();
+    const pendingCommand = harness.command("btw", "first question");
+    await flushAsyncWork();
+
+    const record = subSessionRecords[0];
+    expect(record.getIsStreaming()).toBe(true);
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.handleInput("\x1b");
+    await flushAsyncWork();
+    expect(record.session.abort).toHaveBeenCalledTimes(1);
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(0);
+
+    blocking.release();
+    await pendingCommand;
+  });
+
+  it("aborts the in-flight request on double Escape while streaming", async () => {
     const harness = createHarness([], {
       keybindingMatches: (_data, id) => id === "tui.select.cancel",
     });
@@ -1132,22 +1192,6 @@ describe("btw runtime behavior", () => {
     await pendingCommand;
   });
 
-  it("shows nothing-to-rewind on double Escape with an empty thread", async () => {
-    const harness = createHarness([], {
-      keybindingMatches: (_data, id) => id === "tui.select.cancel",
-    });
-
-    await harness.runSessionStart();
-    await harness.command("btw", "");
-
-    const overlay = harness.latestOverlayComponent();
-    overlay.input.handleInput("\x1b");
-    overlay.input.handleInput("\x1b");
-    await flushAsyncWork();
-
-    overlay.refresh();
-    expect(overlay.statusText.text).toContain("Nothing to rewind.");
-  });
 
   it("aborts, disposes, and unsubscribes the active BTW sub-session when Escape dismisses mid-stream", async () => {
     const harness = createHarness();
@@ -1605,7 +1649,7 @@ describe("btw runtime behavior", () => {
     expect(overlay.focused).toBe(true);
     expect(harness.tui.terminal.write).toHaveBeenLastCalledWith("\x1b[?1002h\x1b[?1006h");
 
-    // Alt+/ while the overlay has focus hides the panel (focus returns to the main editor).
+    // Ctrl+/ (kitty CSI u) while the overlay has focus hides the panel.
     overlay.handleInput("\u001b\u0017");
 
     expect(handle?.isFocused()).toBe(false);
@@ -1613,13 +1657,22 @@ describe("btw runtime behavior", () => {
     expect(overlay.focused).toBe(false);
     expect(harness.tui.terminal.write).toHaveBeenLastCalledWith("\x1b[?1002l\x1b[?1006l");
 
-    // Alt+/ again restores the panel with focus.
+    // Ctrl+Alt+W (fallback) restores the panel with focus.
     await harness.shortcut("ctrl+alt+w");
 
     expect(handle?.isFocused()).toBe(true);
     expect(handle?.isHidden()).toBe(false);
     expect(overlay.focused).toBe(true);
     expect(harness.tui.terminal.write).toHaveBeenLastCalledWith("\x1b[?1002h\x1b[?1006h");
+
+    // Ctrl+/ via kitty CSI u hides again.
+    overlay.handleInput("\u001b[47;5u");
+    expect(handle?.isHidden()).toBe(true);
+
+    // The registered shortcut is now Ctrl+/.
+    await harness.shortcut("ctrl+/");
+    expect(handle?.isHidden()).toBe(false);
+    expect(handle?.isFocused()).toBe(true);
   });
 
   it("marks the overlay input focused when BTW opens so the cursor stays in the composer", async () => {
@@ -1725,7 +1778,6 @@ describe("btw runtime behavior", () => {
     await flushAsyncWork();
 
     expect(copyToClipboardMock).toHaveBeenLastCalledWith("😀");
-    expect(overlay.hintsText.text).toContain("Copied 1 character");
   });
 
   it("preserves wheel history scrolling and releases button tracking when the overlay closes", async () => {

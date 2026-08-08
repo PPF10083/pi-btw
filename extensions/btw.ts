@@ -37,7 +37,7 @@ const BTW_ENTRY_TYPE = "btw-thread-entry";
 const BTW_RESET_TYPE = "btw-thread-reset";
 const BTW_MODEL_OVERRIDE_TYPE = "btw-model-override";
 const BTW_THINKING_OVERRIDE_TYPE = "btw-thinking-override";
-const BTW_FOCUS_SHORTCUTS = [Key.alt("/"), Key.ctrlAlt("w")] as const;
+const BTW_FOCUS_SHORTCUTS = [Key.ctrl("/"), Key.ctrlAlt("w")] as const;
 
 function matchesBtwFocusShortcut(data: string): boolean {
   return BTW_FOCUS_SHORTCUTS.some((shortcut) => matchesKey(data, shortcut));
@@ -1092,11 +1092,13 @@ const BTW_OVERLAY_CHROME_LINES = 9;
 /** Indent applied to transcript block bodies (assistant/thinking/tool-result continuations). */
 const BTW_BLOCK_INDENT = "    ";
 
-/** Double-Escape window for rewinding the last BTW exchange (matches Claude Code's Esc Esc). */
+/** Double-Escape window for entering history reuse mode (matches Claude Code's Esc Esc). */
 const BTW_ESCAPE_DOUBLE_WINDOW_MS = 500;
 
-/** How long the double-escape hint stays visible in the status line. */
-const BTW_ESCAPE_HINT_MS = 900;
+/** Delay before a single Escape (with no input, LLM idle) dismisses the overlay. */
+const BTW_ESCAPE_EXIT_DELAY_MS = 300;
+
+
 const BTW_TRANSCRIPT_START_ROW = 4;
 const BTW_OVERLAY_TOP_MARGIN = 1;
 const BTW_GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
@@ -1197,6 +1199,8 @@ class BtwOverlayComponent extends Container implements Focusable {
   private readonly onSubmitCallback: (value: string) => void;
   private readonly onDismissCallback: () => void;
   private readonly onUnfocusCallback: () => void;
+  private readonly onAbortRequestCallback: () => void;
+  private readonly getIsStreaming: () => boolean;
   private readonly onRewindCallback: () => void;
   private readonly tui: TUI;
   private readonly theme: ExtensionContext["ui"]["theme"];
@@ -1222,8 +1226,7 @@ class BtwOverlayComponent extends Container implements Focusable {
   private statusTextValue = "";
   private hintsTextValue = "";
   private lastEscapeAt = 0;
-  private escapeHintText = "";
-  private escapeHintUntil = 0;
+  private escapeExitTimer: ReturnType<typeof setTimeout> | null = null;
 
   get focused(): boolean {
     return this._focused;
@@ -1242,9 +1245,11 @@ class BtwOverlayComponent extends Container implements Focusable {
     readTranscriptEntries: () => BtwTranscript,
     getStatus: () => string | null,
     getMode: () => BtwThreadMode,
+    getIsStreaming: () => boolean,
     onSubmit: (value: string) => void,
     onDismiss: () => void,
     onUnfocus: () => void,
+    onAbortRequest: () => void,
     onRewind: () => void,
   ) {
     super();
@@ -1254,9 +1259,11 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.readTranscriptEntries = readTranscriptEntries;
     this.getStatus = getStatus;
     this.getMode = getMode;
+    this.getIsStreaming = getIsStreaming;
     this.onSubmitCallback = onSubmit;
     this.onDismissCallback = onDismiss;
     this.onUnfocusCallback = onUnfocus;
+    this.onAbortRequestCallback = onAbortRequest;
     this.onRewindCallback = onRewind;
 
     this.modeText = new Text("", 1, 0);
@@ -1270,6 +1277,9 @@ class BtwOverlayComponent extends Container implements Focusable {
       this.onSubmitCallback(value);
     };
     this.input.onEscape = () => {
+      // Fallback path (custom keybindings that do not deliver Escape to handleInput):
+      // treat it like a single Escape with no input and an idle LLM.
+      this.cancelEscapeExit();
       this.onDismissCallback();
     };
 
@@ -1277,38 +1287,68 @@ class BtwOverlayComponent extends Container implements Focusable {
 
     const originalHandleInput = this.input.handleInput.bind(this.input);
     this.input.handleInput = (data: string) => {
-      if (keybindings.matches(data, "app.clear")) {
-        // Ctrl+C: clear a non-empty composer; dismiss the overlay when empty (Claude Code's Cancel input).
+      if (matchesKey(data, Key.escape)) {
         if (this.input.getValue().length > 0) {
+          // Input present: clear it and reset the double-escape state.
+          this.cancelEscapeExit();
+          this.lastEscapeAt = 0;
           this.input.setValue("");
           this.tui.requestRender();
           return;
         }
 
-        this.onDismissCallback();
-        return;
-      }
-
-      if (matchesKey(data, Key.escape)) {
         const now = Date.now();
         if (now - this.lastEscapeAt <= BTW_ESCAPE_DOUBLE_WINDOW_MS) {
-          // Double-Escape: rewind the last exchange (Claude Code's Esc Esc).
+          // Double-Escape with an idle LLM: rewind the last exchange.
           this.lastEscapeAt = 0;
-          this.escapeHintText = "";
-          this.escapeHintUntil = 0;
+          this.cancelEscapeExit();
           this.onRewindCallback();
           return;
         }
 
         this.lastEscapeAt = now;
-        this.escapeHintText = "Double-Esc to rewind the last exchange · Ctrl+C to exit";
-        this.escapeHintUntil = now + BTW_ESCAPE_HINT_MS;
-        this.tui.requestRender();
+        if (this.getIsStreaming()) {
+          // LLM running: abort the request, keep the panel open.
+          this.cancelEscapeExit();
+          this.onAbortRequestCallback();
+          return;
+        }
+
+        // LLM idle, no input: dismiss after a short delay so a second Escape can
+        // still rewind the last exchange.
+        this.scheduleEscapeExit();
+        return;
+      }
+
+      if (keybindings.matches(data, "app.clear")) {
+        // Ctrl+C: clear a non-empty composer; abort the running request; or dismiss.
+        if (this.input.getValue().length > 0) {
+          this.cancelEscapeExit();
+          this.lastEscapeAt = 0;
+          this.input.setValue("");
+          this.tui.requestRender();
+          return;
+        }
+
+        if (this.getIsStreaming()) {
+          this.cancelEscapeExit();
+          this.onAbortRequestCallback();
+          return;
+        }
+
+        this.cancelEscapeExit();
+        this.onDismissCallback();
         return;
       }
 
       if (keybindings.matches(data, "tui.select.cancel")) {
         // Custom keybindings without app.clear: Ctrl+C falls through here.
+        if (this.getIsStreaming()) {
+          this.cancelEscapeExit();
+          this.onAbortRequestCallback();
+          return;
+        }
+        this.cancelEscapeExit();
         this.onDismissCallback();
         return;
       }
@@ -1316,6 +1356,22 @@ class BtwOverlayComponent extends Container implements Focusable {
     };
 
     this.refresh();
+  }
+
+  private scheduleEscapeExit(): void {
+    this.cancelEscapeExit();
+    this.escapeExitTimer = setTimeout(() => {
+      this.escapeExitTimer = null;
+      this.lastEscapeAt = 0;
+      this.onDismissCallback();
+    }, BTW_ESCAPE_EXIT_DELAY_MS);
+  }
+
+  private cancelEscapeExit(): void {
+    if (this.escapeExitTimer !== null) {
+      clearTimeout(this.escapeExitTimer);
+      this.escapeExitTimer = null;
+    }
   }
 
   private frameLine(content: string, innerWidth: number): string {
@@ -1360,6 +1416,7 @@ class BtwOverlayComponent extends Container implements Focusable {
   }
 
   dispose(): void {
+    this.cancelEscapeExit();
     this.selectionCopyGeneration++;
     this.setMouseTrackingEnabled(false);
   }
@@ -1545,10 +1602,9 @@ class BtwOverlayComponent extends Container implements Focusable {
       }
     }
   }
-
   private buildHintsText(): string {
     const controls =
-      "Drag select/copy · Wheel ↑↓ PgUp/PgDn · Enter · Alt+/ focus · Esc Esc rewind · Ctrl+C clear/exit";
+      "↑↓/PgUp/PgDn scroll · Esc/Ctrl+C clear/exit · Esc+Esc rewind · Ctrl+/ switch main/btw";
     return this.selectionNotice ? `${this.selectionNotice} · ${controls}` : controls;
   }
 
@@ -1588,7 +1644,6 @@ class BtwOverlayComponent extends Container implements Focusable {
         this.updateHints();
       });
   }
-
   private handleMouseEvent(event: BtwMouseEvent): void {
     if (event.wheelDelta !== null) {
       this.scrollTranscript(event.wheelDelta);
@@ -1722,10 +1777,7 @@ class BtwOverlayComponent extends Container implements Focusable {
         ? `${this.summaryTextValue.trim()} · ↑${hiddenAbove} ↓${hiddenBelow}`
         : this.summaryTextValue.trim();
 
-    const statusLine =
-      Date.now() < this.escapeHintUntil && this.escapeHintText
-        ? this.theme.fg("warning", this.escapeHintText)
-        : this.theme.fg("warning", this.statusTextValue.trim());
+    const statusLine = this.theme.fg("warning", this.statusTextValue.trim());
 
     const lines = [this.borderLine(innerWidth, "top")];
 
@@ -1957,39 +2009,20 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * Double-Escape: cancel the in-flight BTW request, or rewind the last completed
-   * exchange (mirrors Claude Code's `Esc Esc` rewind). Rewinds are persisted so they
-   * survive reloads, and repeated rewinds keep unwinding the thread.
+   * Abort the in-flight BTW request (Escape/Ctrl+C while the LLM is running and the
+   * composer is empty). The overlay stays open; runBtw reports the abort state.
    */
-  async function rewindLastExchange(ctx: ExtensionCommandContext | ExtensionContext): Promise<void> {
-    if (activeBtwSession?.session.isStreaming) {
-      setOverlayStatus("Aborting the running request...", ctx);
-      try {
-        await activeBtwSession.session.abort();
-      } catch {
-        // runBtw reports the abort state through its normal failure path.
-      }
+  async function abortActiveBtwRequest(ctx: ExtensionCommandContext | ExtensionContext): Promise<void> {
+    const session = activeBtwSession?.session;
+    if (!session?.isStreaming) {
       return;
     }
-
-    if (pendingThread.length === 0) {
-      setOverlayStatus("Nothing to rewind.", ctx);
-      return;
+    setOverlayStatus("Aborting the running request...", ctx);
+    try {
+      await session.abort();
+    } catch {
+      // runBtw reports the abort state through its normal failure path.
     }
-
-    pendingThread.pop();
-    removeTranscriptTurn(transcriptState, transcriptState.lastTurnId);
-    await disposeBtwSession();
-
-    // Persist the rewind so it survives reloads: a fresh reset marker followed by
-    // the remaining (already-shortened) thread, which restoreThread replays.
-    pi.appendEntry(BTW_RESET_TYPE, { timestamp: Date.now(), mode: pendingMode });
-    for (const details of pendingThread) {
-      pi.appendEntry(BTW_ENTRY_TYPE, details);
-    }
-
-    setOverlayStatus("Rewound the last exchange. Thread preserved.", ctx);
-    syncUi(ctx);
   }
 
   async function resolveBtwModel(
@@ -2206,6 +2239,7 @@ export default function (pi: ExtensionAPI) {
             () => transcriptState.entries,
             () => overlayStatus,
             () => pendingMode,
+            () => activeBtwSession?.session.isStreaming ?? false,
             (value) => {
               void submitFromOverlay(ctx, value);
             },
@@ -2221,6 +2255,9 @@ export default function (pi: ExtensionAPI) {
                 handle.unfocus();
               }
               overlayRuntime?.refresh?.();
+            },
+            () => {
+              void abortActiveBtwRequest(ctx);
             },
             () => {
               void rewindLastExchange(ctx);
@@ -2476,6 +2513,42 @@ export default function (pi: ExtensionAPI) {
     setOverlayStatus("⏳ streaming...", ctx);
     syncUi(ctx);
     await runBtw(cmdCtx, question, false, pendingMode);
+  }
+
+  /**
+   * Double-Escape: cancel the in-flight BTW request, or rewind (remove) the last
+   * completed exchange. Each double-Escape rewinds exactly one message; repeat to
+   * keep unwinding. Rewinds are persisted so they survive reloads.
+   */
+  async function rewindLastExchange(ctx: ExtensionCommandContext | ExtensionContext): Promise<void> {
+    if (activeBtwSession?.session.isStreaming) {
+      setOverlayStatus("Aborting the running request...", ctx);
+      try {
+        await activeBtwSession.session.abort();
+      } catch {
+        // runBtw reports the abort state through its normal failure path.
+      }
+      return;
+    }
+
+    if (pendingThread.length === 0) {
+      setOverlayStatus("Nothing to rewind.", ctx);
+      return;
+    }
+
+    pendingThread.pop();
+    removeTranscriptTurn(transcriptState, transcriptState.lastTurnId);
+    await disposeBtwSession();
+
+    // Persist the rewind so it survives reloads: a fresh reset marker followed by
+    // the remaining (already-shortened) thread, which restoreThread replays.
+    pi.appendEntry(BTW_RESET_TYPE, { timestamp: Date.now(), mode: pendingMode });
+    for (const details of pendingThread) {
+      pi.appendEntry(BTW_ENTRY_TYPE, details);
+    }
+
+    setOverlayStatus("Rewound the last message. Thread preserved.", ctx);
+    syncUi(ctx);
   }
 
   async function resetThread(
