@@ -14,6 +14,7 @@ A maintained fork of [pi-btw](https://github.com/dbachelder/pi-btw) that adds mo
 - supports `/btw:tangent` for a contextless side thread that does not inherit the current main-session conversation
 - opens or refreshes a focused BTW modal shell with its own composer and transcript
 - supports mouse drag selection in the transcript and copies the selection on release
+- renders assistant replies, thinking blocks, and saved notes as markdown (headings, bold, lists, code blocks, tables, and `---` rules) instead of raw syntax
 - keeps the BTW overlay open while you switch focus back to the main editor with `Alt+/`
 - keeps BTW thread entries out of the main agent's future context
 - supports BTW-only model and thinking overrides without changing the main thread settings
@@ -68,13 +69,17 @@ pi install /absolute/path/to/pi-btw
 - persists the BTW exchange as hidden thread state
 - with `--save`, also saves that single exchange as a visible session note
 
+> Note: header-authenticated providers (e.g. gcloud ADC or `--api-key` based setups) are accepted as long as the provider reports `auth.ok`; an explicit `apiKey` is not required.
+
 ## Overlay controls
 
 - drag with the left mouse button in the transcript to select text; releasing copies it to the clipboard
 - the mouse wheel and touchpad continue to scroll transcript history
-- `Alt+/` toggles focus between BTW and the main editor without closing the overlay
+- `Alt+/` toggles the BTW panel visibility: it hides the panel (focus returns to the main editor so the main session is no longer covered), and pressing it again brings the panel back with focus restored
 - `Ctrl+Alt+W` is a fallback focus toggle for terminals that do not deliver `Alt+/` as a usable shortcut
-- `Esc` still dismisses BTW immediately while the overlay is focused
+- `Esc Esc` (double Escape) rewinds the last exchange: it aborts an in-flight request, or removes the last completed exchange from the thread (persisted across reloads, repeatable)
+- a single `Esc` shows a hint and does nothing destructive, so it cannot be triggered by accident
+- `Ctrl+C` clears a non-empty composer, or dismisses BTW when the composer is empty (the thread is preserved)
 - BTW now opens top-centered so the main session remains visible underneath it
 
 ### `/btw:new [question]`
@@ -194,6 +199,10 @@ To use it without installing:
 ```bash
 pi -e /path/to/pi-btw
 ```
+
+Manual test prompts and the overlay screenshot (`docs/btw-overlay.png`) are generated
+from the real rendering pipeline via `tmp/shot.mjs` (run it, then convert the ANSI
+frame with a PNG renderer such as `pureimage`).
 
 ## License
 

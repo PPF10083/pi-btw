@@ -19,6 +19,7 @@ import {
   Container,
   Input,
   Key,
+  Markdown,
   Text,
   matchesKey,
   truncateToWidth,
@@ -26,6 +27,7 @@ import {
   wrapTextWithAnsi,
   type Focusable,
   type KeybindingsManager,
+  type MarkdownTheme,
   type OverlayHandle,
   type TUI,
 } from "@earendil-works/pi-tui";
@@ -815,7 +817,38 @@ function getCompletedExchangeCount(entries: BtwTranscript): number {
   return entries.filter((entry) => entry.type === "assistant-text" && !entry.streaming).length;
 }
 
-function buildOverlayTranscript(entries: BtwTranscript, theme: ExtensionContext["ui"]["theme"]): string[] {
+/**
+ * Build a MarkdownTheme from the extension-provided theme so markdown rendering in the
+ * BTW overlay/saved notes follows the active theme without depending on the global
+ * theme state (which may not be initialized in non-interactive contexts).
+ */
+function buildMarkdownTheme(theme: ExtensionContext["ui"]["theme"]): MarkdownTheme {
+  return {
+    heading: (text) => theme.fg("mdHeading", text),
+    link: (text) => theme.fg("mdLink", text),
+    linkUrl: (text) => theme.fg("mdLinkUrl", text),
+    code: (text) => theme.fg("mdCode", text),
+    codeBlock: (text) => theme.fg("mdCodeBlock", text),
+    codeBlockBorder: (text) => theme.fg("mdCodeBlockBorder", text),
+    quote: (text) => theme.fg("mdQuote", text),
+    quoteBorder: (text) => theme.fg("mdQuoteBorder", text),
+    hr: (text) => theme.fg("mdHr", text),
+    listBullet: (text) => theme.fg("mdListBullet", text),
+    bold: (text) => theme.bold(text),
+    italic: (text) => theme.italic(text),
+    strikethrough: (text) => theme.strikethrough(text),
+    underline: (text) => theme.underline(text),
+    // Keep code blocks in the overlay simple: no syntax highlighting, just the code-block color.
+    highlightCode: (code) => code.split("\n").map((line) => theme.fg("mdCodeBlock", line)),
+  };
+}
+
+function buildOverlayTranscript(
+  entries: BtwTranscript,
+  theme: ExtensionContext["ui"]["theme"],
+  markdownTheme: MarkdownTheme,
+  contentWidth: number,
+): string[] {
   if (entries.length === 0) {
     return [theme.fg("dim", "No BTW thread yet. Ask a side question to start one.")];
   }
@@ -826,7 +859,7 @@ function buildOverlayTranscript(entries: BtwTranscript, theme: ExtensionContext[
   const toolBadge = buildTranscriptBadge(theme, "Tool", "toolPendingBg", "warning");
   const assistantBadge = buildTranscriptBadge(theme, "Assistant", "customMessageBg", "success");
   const separator = theme.fg("borderMuted", "────────────────────────────────────────");
-  const blockIndent = "    ";
+  const blockIndent = BTW_BLOCK_INDENT;
   const resultIndent = blockIndent;
 
   const pushBlankLine = () => {
@@ -887,9 +920,19 @@ function buildOverlayTranscript(entries: BtwTranscript, theme: ExtensionContext[
 
     if (entry.type === "thinking") {
       const thinkingHeader = entry.streaming ? `${thinkingBadge} ${theme.fg("warning", "▍")}` : thinkingBadge;
-      pushStackedBlock(thinkingHeader, entry.text, {
-        style: (line) => theme.fg("warning", theme.italic(line)),
-      });
+      // Render reasoning as markdown (matching the main agent) while keeping the BTW
+      // overlay's amber thinking look via a warning-colored italic default text style.
+      const markdownLines = new Markdown(entry.text, 0, 0, markdownTheme, {
+        color: (text: string) => theme.fg("warning", text),
+        italic: true,
+      })
+        .render(Math.max(1, contentWidth))
+        .map((line) => line.replace(/\s+$/u, ""));
+      pushBlankLine();
+      lines.push(thinkingHeader);
+      for (const line of markdownLines) {
+        lines.push(line ? `${blockIndent}${line}` : "");
+      }
       continue;
     }
 
@@ -917,7 +960,16 @@ function buildOverlayTranscript(entries: BtwTranscript, theme: ExtensionContext[
 
     if (entry.type === "assistant-text") {
       const assistantHeader = entry.streaming ? `${assistantBadge} ${theme.fg("warning", "▍")}` : assistantBadge;
-      pushStackedBlock(assistantHeader, entry.text);
+      // Render the assistant response as styled markdown instead of raw text so that
+      // headings, lists, code blocks, tables, and inline formatting are actually parsed.
+      const markdownLines = new Markdown(entry.text, 0, 0, markdownTheme)
+        .render(Math.max(1, contentWidth))
+        .map((line) => line.replace(/\s+$/u, ""));
+      pushBlankLine();
+      lines.push(assistantHeader);
+      for (const line of markdownLines) {
+        lines.push(line ? `${blockIndent}${line}` : "");
+      }
     }
   }
 
@@ -1036,6 +1088,15 @@ function notify(ctx: ExtensionContext | ExtensionCommandContext, message: string
 
 /** Fixed overlay rows outside the transcript viewport (must match render() structure). */
 const BTW_OVERLAY_CHROME_LINES = 9;
+
+/** Indent applied to transcript block bodies (assistant/thinking/tool-result continuations). */
+const BTW_BLOCK_INDENT = "    ";
+
+/** Double-Escape window for rewinding the last BTW exchange (matches Claude Code's Esc Esc). */
+const BTW_ESCAPE_DOUBLE_WINDOW_MS = 500;
+
+/** How long the double-escape hint stays visible in the status line. */
+const BTW_ESCAPE_HINT_MS = 900;
 const BTW_TRANSCRIPT_START_ROW = 4;
 const BTW_OVERLAY_TOP_MARGIN = 1;
 const BTW_GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
@@ -1136,11 +1197,14 @@ class BtwOverlayComponent extends Container implements Focusable {
   private readonly onSubmitCallback: (value: string) => void;
   private readonly onDismissCallback: () => void;
   private readonly onUnfocusCallback: () => void;
+  private readonly onRewindCallback: () => void;
   private readonly tui: TUI;
   private readonly theme: ExtensionContext["ui"]["theme"];
+  private readonly markdownTheme: MarkdownTheme;
   private transcriptLines: string[] = [];
   private transcriptScrollOffset = 0;
   private transcriptViewportHeight = 8;
+  private contentWidth = 66;
   private followTranscript = true;
   private renderedTranscriptLines: string[] = [];
   private renderedTranscriptPlainLines: string[] = [];
@@ -1157,6 +1221,9 @@ class BtwOverlayComponent extends Container implements Focusable {
   private summaryTextValue = "";
   private statusTextValue = "";
   private hintsTextValue = "";
+  private lastEscapeAt = 0;
+  private escapeHintText = "";
+  private escapeHintUntil = 0;
 
   get focused(): boolean {
     return this._focused;
@@ -1178,16 +1245,19 @@ class BtwOverlayComponent extends Container implements Focusable {
     onSubmit: (value: string) => void,
     onDismiss: () => void,
     onUnfocus: () => void,
+    onRewind: () => void,
   ) {
     super();
     this.tui = tui;
     this.theme = theme;
+    this.markdownTheme = buildMarkdownTheme(theme);
     this.readTranscriptEntries = readTranscriptEntries;
     this.getStatus = getStatus;
     this.getMode = getMode;
     this.onSubmitCallback = onSubmit;
     this.onDismissCallback = onDismiss;
     this.onUnfocusCallback = onUnfocus;
+    this.onRewindCallback = onRewind;
 
     this.modeText = new Text("", 1, 0);
     this.summaryText = new Text("", 1, 0);
@@ -1208,6 +1278,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     const originalHandleInput = this.input.handleInput.bind(this.input);
     this.input.handleInput = (data: string) => {
       if (keybindings.matches(data, "app.clear")) {
+        // Ctrl+C: clear a non-empty composer; dismiss the overlay when empty (Claude Code's Cancel input).
         if (this.input.getValue().length > 0) {
           this.input.setValue("");
           this.tui.requestRender();
@@ -1218,7 +1289,26 @@ class BtwOverlayComponent extends Container implements Focusable {
         return;
       }
 
+      if (matchesKey(data, Key.escape)) {
+        const now = Date.now();
+        if (now - this.lastEscapeAt <= BTW_ESCAPE_DOUBLE_WINDOW_MS) {
+          // Double-Escape: rewind the last exchange (Claude Code's Esc Esc).
+          this.lastEscapeAt = 0;
+          this.escapeHintText = "";
+          this.escapeHintUntil = 0;
+          this.onRewindCallback();
+          return;
+        }
+
+        this.lastEscapeAt = now;
+        this.escapeHintText = "Double-Esc to rewind the last exchange · Ctrl+C to exit";
+        this.escapeHintUntil = now + BTW_ESCAPE_HINT_MS;
+        this.tui.requestRender();
+        return;
+      }
+
       if (keybindings.matches(data, "tui.select.cancel")) {
+        // Custom keybindings without app.clear: Ctrl+C falls through here.
         this.onDismissCallback();
         return;
       }
@@ -1457,7 +1547,8 @@ class BtwOverlayComponent extends Container implements Focusable {
   }
 
   private buildHintsText(): string {
-    const controls = "Drag select/copy · Wheel ↑↓ PgUp/PgDn · Enter · Alt+/ focus · Esc";
+    const controls =
+      "Drag select/copy · Wheel ↑↓ PgUp/PgDn · Enter · Alt+/ focus · Esc Esc rewind · Ctrl+C clear/exit";
     return this.selectionNotice ? `${this.selectionNotice} · ${controls}` : controls;
   }
 
@@ -1591,6 +1682,11 @@ class BtwOverlayComponent extends Container implements Focusable {
   override render(width: number): string[] {
     const dialogWidth = Math.max(24, width);
     const innerWidth = Math.max(22, dialogWidth - 2);
+    const contentWidth = Math.max(1, innerWidth - BTW_BLOCK_INDENT.length);
+    if (contentWidth !== this.contentWidth) {
+      this.contentWidth = contentWidth;
+      this.rebuildTranscriptLines();
+    }
     const transcriptLines = this.wrapTranscript(innerWidth);
     if (this.renderedTranscriptInnerWidth !== 0 && this.renderedTranscriptInnerWidth !== innerWidth) {
       this.clearTranscriptSelection();
@@ -1626,6 +1722,11 @@ class BtwOverlayComponent extends Container implements Focusable {
         ? `${this.summaryTextValue.trim()} · ↑${hiddenAbove} ↓${hiddenBelow}`
         : this.summaryTextValue.trim();
 
+    const statusLine =
+      Date.now() < this.escapeHintUntil && this.escapeHintText
+        ? this.theme.fg("warning", this.escapeHintText)
+        : this.theme.fg("warning", this.statusTextValue.trim());
+
     const lines = [this.borderLine(innerWidth, "top")];
 
     lines.push(this.frameLine(this.theme.fg("accent", this.theme.bold(this.modeTextValue.trim())), innerWidth));
@@ -1641,7 +1742,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     }
 
     lines.push(this.ruleLine(innerWidth));
-    lines.push(this.frameLine(this.theme.fg("warning", this.statusTextValue.trim()), innerWidth));
+    lines.push(this.frameLine(statusLine, innerWidth));
     lines.push(this.inputFrameLine(dialogWidth));
     lines.push(this.frameLine(this.theme.fg("dim", this.hintsTextValue.trim()), innerWidth));
     lines.push(this.borderLine(innerWidth, "bottom"));
@@ -1662,6 +1763,15 @@ class BtwOverlayComponent extends Container implements Focusable {
     return this.readTranscriptEntries().map((entry) => ({ ...entry }));
   }
 
+  private rebuildTranscriptLines(): void {
+    this.transcriptLines = buildOverlayTranscript(
+      this.readTranscriptEntries(),
+      this.theme,
+      this.markdownTheme,
+      this.contentWidth,
+    );
+  }
+
   refresh(): void {
     this.modeTextValue = `${getOverlayTitle(this.getMode())} · hidden thread preserved`;
     this.modeText.setText(this.modeTextValue);
@@ -1674,7 +1784,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.summaryTextValue = `${exchanges} exchange${exchanges === 1 ? "" : "s"}${active}`;
     this.summaryText.setText(this.summaryTextValue);
 
-    this.transcriptLines = buildOverlayTranscript(entries, this.theme);
+    this.rebuildTranscriptLines();
     this.transcript.clear();
     for (const line of this.transcriptLines) {
       this.transcript.addChild(new Text(line, 1, 0));
@@ -1724,17 +1834,24 @@ export default function (pi: ExtensionAPI) {
     overlayRuntime = null;
   }
 
+  /**
+   * Alt+/ (or Ctrl+Alt+W): toggle the overlay's visibility. Hiding releases focus back
+   * to the main editor so the panel no longer covers the main session; pressing the
+   * shortcut again brings the panel back with focus restored.
+   */
   function toggleOverlayFocus(): void {
     const handle = overlayRuntime?.handle;
     if (!handle) {
       return;
     }
 
-    handle.setHidden(false);
-    if (handle.isFocused()) {
-      handle.unfocus();
-    } else {
+    if (handle.isHidden()) {
+      handle.setHidden(false);
+      // The BTW overlay is nonCapturing, so showing it does not auto-focus.
       handle.focus();
+    } else {
+      handle.setHidden(true);
+      handle.unfocus();
     }
     overlayRuntime?.refresh?.();
   }
@@ -1839,13 +1956,49 @@ export default function (pi: ExtensionAPI) {
     await disposeBtwSession();
   }
 
+  /**
+   * Double-Escape: cancel the in-flight BTW request, or rewind the last completed
+   * exchange (mirrors Claude Code's `Esc Esc` rewind). Rewinds are persisted so they
+   * survive reloads, and repeated rewinds keep unwinding the thread.
+   */
+  async function rewindLastExchange(ctx: ExtensionCommandContext | ExtensionContext): Promise<void> {
+    if (activeBtwSession?.session.isStreaming) {
+      setOverlayStatus("Aborting the running request...", ctx);
+      try {
+        await activeBtwSession.session.abort();
+      } catch {
+        // runBtw reports the abort state through its normal failure path.
+      }
+      return;
+    }
+
+    if (pendingThread.length === 0) {
+      setOverlayStatus("Nothing to rewind.", ctx);
+      return;
+    }
+
+    pendingThread.pop();
+    removeTranscriptTurn(transcriptState, transcriptState.lastTurnId);
+    await disposeBtwSession();
+
+    // Persist the rewind so it survives reloads: a fresh reset marker followed by
+    // the remaining (already-shortened) thread, which restoreThread replays.
+    pi.appendEntry(BTW_RESET_TYPE, { timestamp: Date.now(), mode: pendingMode });
+    for (const details of pendingThread) {
+      pi.appendEntry(BTW_ENTRY_TYPE, details);
+    }
+
+    setOverlayStatus("Rewound the last exchange. Thread preserved.", ctx);
+    syncUi(ctx);
+  }
+
   async function resolveBtwModel(
     ctx: ExtensionCommandContext,
     notifyOnFallback = false,
   ): Promise<ResolvedBtwModel> {
     if (btwModelOverride) {
       const auth = await ctx.modelRegistry.getApiKeyAndHeaders(btwModelOverride);
-      if (auth.ok && auth.apiKey) {
+      if (auth.ok) {
         return {
           model: btwModelOverride,
           source: "override",
@@ -2060,8 +2213,17 @@ export default function (pi: ExtensionAPI) {
               void dismissOverlaySession();
             },
             () => {
-              overlayRuntime?.handle?.unfocus();
+              // Alt+/ received while the overlay has focus: hide the panel so the
+              // main session is visible again (focus returns to the main editor).
+              const handle = overlayRuntime?.handle;
+              if (handle) {
+                handle.setHidden(true);
+                handle.unfocus();
+              }
               overlayRuntime?.refresh?.();
+            },
+            () => {
+              void rewindLastExchange(ctx);
             },
           );
 
@@ -2420,8 +2582,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-    if (!auth.ok || !auth.apiKey) {
-      const message = auth.ok ? `No credentials available for ${model.provider}/${model.id}.` : auth.error;
+    if (!auth.ok) {
+      const message = auth.error || `No credentials available for ${model.provider}/${model.id}.`;
       setOverlayStatus(message, ctx);
       notify(ctx, message, "error");
       await ensureOverlay(ctx);
@@ -2527,8 +2689,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-    if (!auth.ok || !auth.apiKey) {
-      throw new Error(auth.ok ? `No credentials available for ${model.provider}/${model.id}.` : auth.error);
+    if (!auth.ok) {
+      throw new Error(auth.error || `No credentials available for ${model.provider}/${model.id}.`);
     }
 
     const sessionOptions = {
@@ -2577,28 +2739,43 @@ export default function (pi: ExtensionAPI) {
   pi.registerMessageRenderer(BTW_MESSAGE_TYPE, (message, { expanded }, theme) => {
     const details = message.details as BtwDetails | undefined;
     const content = typeof message.content === "string" ? message.content : "[non-text btw message]";
-    const lines = [theme.fg("accent", theme.bold("[BTW]")), content];
+
+    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+    box.addChild(new Text(theme.fg("accent", theme.bold("[BTW]")), 0, 0));
+    // Render the saved note body as markdown so headings/code/lists are formatted,
+    // matching how the main agent renders assistant messages.
+    box.addChild(
+      new Markdown(content, 0, 0, buildMarkdownTheme(theme), {
+        color: (text: string) => theme.fg("customMessageText", text),
+      }),
+    );
 
     if (expanded && details) {
-      lines.push(
-        theme.fg(
-          "dim",
-          `model: ${details.provider}/${details.model} (${details.api ?? "openai-responses"}) · thinking: ${details.thinkingLevel}`,
+      box.addChild(
+        new Text(
+          theme.fg(
+            "dim",
+            `model: ${details.provider}/${details.model} (${details.api ?? "openai-responses"}) · thinking: ${details.thinkingLevel}`,
+          ),
+          0,
+          0,
         ),
       );
 
       if (details.usage) {
-        lines.push(
-          theme.fg(
-            "dim",
-            `tokens: in ${details.usage.input} · out ${details.usage.output} · total ${details.usage.totalTokens}`,
+        box.addChild(
+          new Text(
+            theme.fg(
+              "dim",
+              `tokens: in ${details.usage.input} · out ${details.usage.output} · total ${details.usage.totalTokens}`,
+            ),
+            0,
+            0,
           ),
         );
       }
     }
 
-    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
-    box.addChild(new Text(lines.join("\n"), 0, 0));
     return box;
   });
 

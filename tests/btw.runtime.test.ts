@@ -456,6 +456,8 @@ function createHarness(
       bg: (name: string, text: string) => string;
       italic: (text: string) => string;
       bold: (text: string) => string;
+      underline: (text: string) => string;
+      strikethrough: (text: string) => string;
     };
     keybindingMatches?: (data: string, id: string) => boolean;
   } = {},
@@ -483,6 +485,8 @@ function createHarness(
     bg: (_name: string, text: string) => text,
     italic: (text: string) => text,
     bold: (text: string) => text,
+    underline: (text: string) => text,
+    strikethrough: (text: string) => text,
   };
   const keybindings = {
     matches: options.keybindingMatches ?? ((_data: string, _id: string) => false),
@@ -591,9 +595,13 @@ function createHarness(
       getApiKeyAndHeaders: vi.fn(async (requestedModel: { provider: string; id: string; api: string }) => {
         if (credentialResolver) {
           const key = credentialResolver(requestedModel);
-          return key ? { ok: true, apiKey: key, headers: undefined } : { ok: true, apiKey: undefined, headers: undefined };
+          return key
+            ? { ok: true, apiKey: key, headers: undefined }
+            : { ok: false, error: `No credentials available for ${requestedModel.provider}/${requestedModel.id}.` };
         }
-        return hasCredentials ? { ok: true, apiKey: "test-key", headers: undefined } : { ok: true, apiKey: undefined, headers: undefined };
+        return hasCredentials
+          ? { ok: true, apiKey: "test-key", headers: undefined }
+          : { ok: false, error: "No credentials available for test-provider/test-model." };
       }),
       // pi 0.74 ExtensionContext.modelRegistry.find(provider, modelId) -> Model<Api> | undefined.
       // The mock looks up entries from `registeredModels`; falls back to a default api so legacy
@@ -1061,7 +1069,70 @@ describe("btw runtime behavior", () => {
     expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
   });
 
-  it("still dismisses the BTW overlay on select cancel", async () => {
+  it("does not dismiss on a single Escape; double Escape rewinds the last exchange", async () => {
+    const harness = createHarness([], {
+      keybindingMatches: (_data, id) => id === "tui.select.cancel",
+    });
+
+    await harness.runSessionStart();
+    promptStreamMock.mockImplementationOnce(() => streamAnswer("First answer"));
+    await harness.command("btw", "first question");
+
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.setValue("draft follow-up");
+
+    // A single Escape neither dismisses nor clears; it shows the rewind hint.
+    overlay.input.handleInput("\x1b");
+    await flushAsyncWork();
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(0);
+    expect(overlay.input.getValue()).toBe("draft follow-up");
+    expect(overlay.render(96).join("\n")).toContain("Double-Esc");
+
+    // A second Escape within the window rewinds the last exchange.
+    overlay.input.handleInput("\x1b");
+    await flushAsyncWork();
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(0);
+    overlay.refresh();
+    expect(overlay.statusText.text).toContain("Rewound");
+
+    // The rewind is persisted via a reset marker; a reload restores the empty thread.
+    expect(getCustomEntries(harness.entries, "btw-thread-reset")).toHaveLength(1);
+    await harness.runSessionStart();
+    const restored = harness.latestOverlayComponent();
+    restored.refresh();
+    expect(restored.transcript.children.map((child: any) => child.text).join("\n")).toContain(
+      "No BTW thread yet",
+    );
+  });
+
+  it("aborts the in-flight BTW request on double Escape without dismissing", async () => {
+    const harness = createHarness([], {
+      keybindingMatches: (_data, id) => id === "tui.select.cancel",
+    });
+    const blocking = createBlockingToolStream();
+    promptStreamMock.mockImplementation(() => blocking.stream());
+
+    await harness.runSessionStart();
+    const pendingCommand = harness.command("btw", "first question");
+    await flushAsyncWork();
+
+    const record = subSessionRecords[0];
+    expect(record.getIsStreaming()).toBe(true);
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.handleInput("\x1b");
+    overlay.input.handleInput("\x1b");
+    await flushAsyncWork();
+
+    expect(record.session.abort).toHaveBeenCalledTimes(1);
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(0);
+
+    blocking.release();
+    await pendingCommand;
+  });
+
+  it("shows nothing-to-rewind on double Escape with an empty thread", async () => {
     const harness = createHarness([], {
       keybindingMatches: (_data, id) => id === "tui.select.cancel",
     });
@@ -1070,11 +1141,12 @@ describe("btw runtime behavior", () => {
     await harness.command("btw", "");
 
     const overlay = harness.latestOverlayComponent();
-    overlay.input.setValue("draft follow-up");
+    overlay.input.handleInput("\x1b");
     overlay.input.handleInput("\x1b");
     await flushAsyncWork();
 
-    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
+    overlay.refresh();
+    expect(overlay.statusText.text).toContain("Nothing to rewind.");
   });
 
   it("aborts, disposes, and unsubscribes the active BTW sub-session when Escape dismisses mid-stream", async () => {
@@ -1286,6 +1358,8 @@ describe("btw runtime behavior", () => {
         bg: (name: string, text: string) => `<bg:${name}>${text}</bg:${name}>`,
         italic: (text: string) => `<italic>${text}</italic>`,
         bold: (text: string) => `<bold>${text}</bold>`,
+        underline: (text: string) => `<underline>${text}</underline>`,
+        strikethrough: (text: string) => `<strike>${text}</strike>`,
       },
     });
     const longToolResult = ["line 1", "line 2", "x".repeat(420)].join("\n");
@@ -1319,7 +1393,7 @@ describe("btw runtime behavior", () => {
 
     const transcript = transcriptText(overlay);
     expect(transcript).toContain("<bg:toolPendingBg>");
-    expect(transcript).toContain("<italic>Inspecting package.json</italic>");
+    expect(transcript).toContain("<italic><fg:warning>Inspecting package.json</fg:warning></italic>");
     expect(transcript).toContain("<bold>read</bold>");
     expect(transcript).toContain("package.json");
     expect(transcript).toContain("↳ result");
@@ -1422,6 +1496,8 @@ describe("btw runtime behavior", () => {
         bg: (name: string, text: string) => `<bg:${name}>${text}</bg:${name}>`,
         italic: (text: string) => `<italic>${text}</italic>`,
         bold: (text: string) => `<bold>${text}</bold>`,
+        underline: (text: string) => `<underline>${text}</underline>`,
+        strikethrough: (text: string) => `<strike>${text}</strike>`,
       },
     });
     promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
@@ -1453,6 +1529,53 @@ describe("btw runtime behavior", () => {
     });
   });
 
+  it("accepts header-authenticated models (auth.ok without apiKey) instead of aborting", async () => {
+    const harness = createHarness();
+    // Simulate a provider whose auth resolves through headers only (e.g. gcloud ADC or
+    // --api-key based providers): auth.ok is true but apiKey is undefined.
+    harness.baseCtx.modelRegistry.getApiKeyAndHeaders = vi.fn(async () => ({
+      ok: true,
+      headers: { authorization: "Bearer header-auth" },
+    }));
+    promptStreamMock.mockImplementation(() => streamAnswer("Header auth works."));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "ping");
+
+    // The sub-session was created and the prompt went through instead of aborting.
+    expect(subSessionRecords).toHaveLength(1);
+    expect(subSessionRecords[0].promptCalls.map((call) => call.text)).toContain("ping");
+    const overlay = harness.latestOverlayComponent();
+    overlay.refresh();
+    expect(overlay.statusText.text).not.toContain("No credentials available");
+  });
+
+  it("renders markdown in the overlay transcript instead of literal syntax", async () => {
+    const harness = createHarness();
+    const markdownAnswer = [
+      "# Heading",
+      "",
+      "Some **bold** text.",
+      "",
+      "---",
+      "",
+      "After the rule.",
+    ].join("\n");
+    promptStreamMock.mockImplementation(() => streamAnswer(markdownAnswer));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "show me markdown");
+
+    const transcript = transcriptText(harness.latestOverlayComponent());
+    // Thematic break renders as a styled horizontal rule, not literal ---
+    expect(transcript).not.toContain("---");
+    expect(transcript).toContain("────────────────");
+    // Heading and inline bold are styled instead of showing raw markers.
+    expect(transcript).not.toContain("# Heading");
+    expect(transcript).not.toContain("**bold**");
+    expect(transcript).toContain("After the rule.");
+  });
+
   it("keeps BTW in a top-centered non-capturing overlay and does not leave a persistent widget above the main input", async () => {
     const harness = createHarness();
     promptStreamMock.mockImplementation(() => streamAnswer("Overlay answer"));
@@ -1470,7 +1593,7 @@ describe("btw runtime behavior", () => {
     expect(harness.widgets.some((entry) => entry.key === "btw" && typeof entry.content === "function")).toBe(false);
   });
 
-  it("toggles BTW overlay focus with the registered focus shortcuts without closing it", async () => {
+  it("toggles BTW overlay visibility with the registered focus shortcuts", async () => {
     const harness = createHarness();
 
     await harness.runSessionStart();
@@ -1482,13 +1605,15 @@ describe("btw runtime behavior", () => {
     expect(overlay.focused).toBe(true);
     expect(harness.tui.terminal.write).toHaveBeenLastCalledWith("\x1b[?1002h\x1b[?1006h");
 
+    // Alt+/ while the overlay has focus hides the panel (focus returns to the main editor).
     overlay.handleInput("\u001b\u0017");
 
     expect(handle?.isFocused()).toBe(false);
-    expect(handle?.isHidden()).toBe(false);
+    expect(handle?.isHidden()).toBe(true);
     expect(overlay.focused).toBe(false);
     expect(harness.tui.terminal.write).toHaveBeenLastCalledWith("\x1b[?1002l\x1b[?1006l");
 
+    // Alt+/ again restores the panel with focus.
     await harness.shortcut("ctrl+alt+w");
 
     expect(handle?.isFocused()).toBe(true);
@@ -1659,6 +1784,8 @@ describe("btw runtime behavior", () => {
         bg: (name: string, text: string) => `<bg:${name}>${text}</bg:${name}>`,
         italic: (text: string) => `<italic>${text}</italic>`,
         bold: (text: string) => `<bold>${text}</bold>`,
+        underline: (text: string) => `<underline>${text}</underline>`,
+        strikethrough: (text: string) => `<strike>${text}</strike>`,
       },
     });
     promptStreamMock.mockImplementationOnce(() => streamAnswer("First answer"));
