@@ -434,7 +434,7 @@ function getCustomEntries(entries: SessionEntry[], customType: string): CustomEn
 
 function transcriptText(overlay: any): string {
   overlay.refresh();
-  return overlay.transcript.children.map((child: any) => child.text).join("\n");
+  return overlay.getTranscriptLines().join("\n");
 }
 
 function transcriptEntries(overlay: any) {
@@ -529,6 +529,7 @@ function createHarness(
       options?.onHandle?.(handle);
       const component = await factory(tui as any, theme as any, keybindings as any, done);
       overlays.push({ factoryOptions: options, done, component });
+      void resultPromise.then(() => handle.hide());
       return resultPromise;
     },
     onTerminalInput: () => () => {},
@@ -588,6 +589,7 @@ function createHarness(
   btwExtension(api);
 
   const baseCtx = {
+    mode: "tui",
     hasUI: true,
     ui: ui as any,
     sessionManager: sessionManager as any,
@@ -614,6 +616,7 @@ function createHarness(
       }),
     },
     model,
+    cwd: "/test/project",
     getSystemPrompt: () => "system",
     isIdle: () => idle,
   };
@@ -730,6 +733,8 @@ describe("btw runtime behavior", () => {
 
     const options = createAgentSessionMock.mock.calls[0][0];
     expect(options.model).toBe(harness.baseCtx.model);
+    expect(options.cwd).toBe(harness.baseCtx.cwd);
+    expect(sessionManagerInMemoryMock).toHaveBeenCalledWith(harness.baseCtx.cwd);
     expect(options.modelRegistry).toBe(harness.baseCtx.modelRegistry);
     expect(options.modelRuntime).toBeUndefined();
     expect(options.tools).toEqual(["read", "bash", "edit", "write"]);
@@ -1103,7 +1108,7 @@ describe("btw runtime behavior", () => {
     await harness.runSessionStart();
     const restored = harness.latestOverlayComponent();
     restored.refresh();
-    const restoredText = restored.transcript.children.map((child: any) => child.text).join("\n");
+    const restoredText = restored.getTranscriptLines().join("\n");
     expect(restoredText).toContain("first question");
     expect(restoredText).not.toContain("second question");
   });
@@ -1516,6 +1521,141 @@ describe("btw runtime behavior", () => {
     expect(overlay.statusText.text).toContain("Ready for a follow-up");
   });
 
+  it("cancels the delayed single-Escape dismissal when the user keeps typing", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createHarness();
+
+      await harness.runSessionStart();
+      await harness.command("btw", "");
+
+      const overlay = harness.latestOverlayComponent();
+      overlay.handleInput("\x1b");
+      overlay.handleInput("a");
+      await vi.advanceTimersByTimeAsync(350);
+
+      expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(0);
+      expect(overlay.getDraft()).toBe("");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("coalesces bursty streaming updates and flushes the final frame immediately", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createHarness();
+
+      await harness.runSessionStart();
+      await harness.command("btw", "");
+
+      const overlay = harness.latestOverlayComponent();
+      const refreshSpy = vi.spyOn(overlay, "refresh");
+      refreshSpy.mockClear();
+      harness.tui.requestRender.mockClear();
+
+      const record = subSessionRecords[0];
+      const makeStreamingMessage = (text: string) => ({
+        ...makeAssistantMessage(text),
+        content: [{ type: "text" as const, text }],
+        stopReason: "pending" as const,
+      });
+
+      record.emit({ type: "turn_start" });
+      record.emit({ type: "message_start", message: makeStreamingMessage("") });
+      refreshSpy.mockClear();
+      harness.tui.requestRender.mockClear();
+
+      for (let i = 1; i <= 100; i++) {
+        record.emit({ type: "message_update", message: makeStreamingMessage("x".repeat(i)) });
+      }
+
+      expect(refreshSpy).not.toHaveBeenCalled();
+      expect(harness.tui.requestRender).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(31);
+      expect(refreshSpy).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(refreshSpy).toHaveBeenCalledTimes(1);
+
+      record.emit({ type: "message_end", message: makeAssistantMessage("final answer") });
+      expect(refreshSpy).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(refreshSpy).toHaveBeenCalledTimes(2);
+      expect(findLatest(transcriptEntries(overlay), (entry: any) => entry.type === "assistant-text")).toMatchObject({
+        text: "final answer",
+        streaming: false,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not render hidden streaming updates and catches up once when restored", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createHarness();
+
+      await harness.runSessionStart();
+      await harness.command("btw", "");
+
+      const overlay = harness.latestOverlayComponent();
+      const refreshSpy = vi.spyOn(overlay, "refresh");
+      await harness.shortcut("ctrl+/");
+      expect(harness.overlayHandles.at(-1)?.isHidden()).toBe(true);
+      refreshSpy.mockClear();
+      harness.tui.requestRender.mockClear();
+
+      const record = subSessionRecords[0];
+      const streamingMessage = {
+        ...makeAssistantMessage("hidden update"),
+        content: [{ type: "text" as const, text: "hidden update" }],
+        stopReason: "pending" as const,
+      };
+      record.emit({ type: "turn_start" });
+      record.emit({ type: "message_start", message: streamingMessage });
+      record.emit({ type: "message_update", message: streamingMessage });
+      record.emit({ type: "message_end", message: makeAssistantMessage("hidden final") });
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(refreshSpy).not.toHaveBeenCalled();
+      expect(harness.tui.requestRender).not.toHaveBeenCalled();
+      expect(record.session.abort).not.toHaveBeenCalled();
+      expect(record.getListenerCount()).toBe(1);
+
+      await harness.shortcut("ctrl+/");
+      expect(refreshSpy).toHaveBeenCalledTimes(1);
+      expect(harness.overlayHandles.at(-1)?.isHidden()).toBe(false);
+      expect(findLatest(transcriptEntries(overlay), (entry: any) => entry.type === "assistant-text")).toMatchObject({
+        text: "hidden final",
+        streaming: false,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reuses completed Markdown and wrapped transcript caches across status-only renders", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("# Cached heading\n\nCached body"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "cache it");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.render(80);
+    const markdownCache = overlay.markdownRenderCache;
+    const firstCacheRecord = [...markdownCache.values()].find((entry: any) => entry.type === "assistant-text");
+    const firstWrappedLineCache = overlay.wrappedLineCache;
+    expect(firstCacheRecord).toBeDefined();
+
+    overlay.refresh();
+    overlay.render(80);
+
+    expect([...markdownCache.values()].find((entry: any) => entry.type === "assistant-text")).toBe(firstCacheRecord);
+    expect(overlay.wrappedLineCache.every((entry: unknown, index: number) => entry === firstWrappedLineCache[index])).toBe(true);
+  });
+
   it("clears the modal composer after a follow-up is submitted", async () => {
     const harness = createHarness();
     promptStreamMock
@@ -1620,7 +1760,7 @@ describe("btw runtime behavior", () => {
     expect(transcript).toContain("After the rule.");
   });
 
-  it("keeps BTW in a top-centered non-capturing overlay and does not leave a persistent widget above the main input", async () => {
+  it("keeps BTW in a fullscreen non-capturing overlay and does not leave a persistent widget above the main input", async () => {
     const harness = createHarness();
     promptStreamMock.mockImplementation(() => streamAnswer("Overlay answer"));
 
@@ -1630,7 +1770,10 @@ describe("btw runtime behavior", () => {
     expect(harness.overlays.at(-1)?.factoryOptions).toMatchObject({
       overlay: true,
       overlayOptions: {
-        anchor: "top-center",
+        width: "100%",
+        maxHeight: "100%",
+        anchor: "top-left",
+        margin: 0,
         nonCapturing: true,
       },
     });
@@ -1732,33 +1875,34 @@ describe("btw runtime behavior", () => {
 
     const overlay = harness.latestOverlayComponent();
     overlay.render(80);
+    const transcriptRow = 5;
 
-    overlay.handleInput("\x1b[<0;12;6M");
-    overlay.handleInput("\x1b[<0;12;6m");
+    overlay.handleInput(`\x1b[<0;2;${transcriptRow}M`);
+    overlay.handleInput(`\x1b[<0;2;${transcriptRow}m`);
     await flushAsyncWork();
     expect(copyToClipboardMock).not.toHaveBeenCalled();
 
-    overlay.handleInput("\x1b[<0;12;6M");
-    overlay.handleInput("\x1b[<32;22;6M");
+    overlay.handleInput(`\x1b[<0;2;${transcriptRow}M`);
+    overlay.handleInput(`\x1b[<32;12;${transcriptRow}M`);
     expect(overlay.getSelectedTranscriptText()).toBe(" You  selec");
-    overlay.handleInput("\x1b[<0;22;6m");
+    overlay.handleInput(`\x1b[<0;12;${transcriptRow}m`);
     await flushAsyncWork();
     expect(copyToClipboardMock).toHaveBeenLastCalledWith(" You  selec");
 
-    overlay.handleInput("\x1b[<0;22;6M");
-    overlay.handleInput("\x1b[<32;12;6M");
+    overlay.handleInput(`\x1b[<0;12;${transcriptRow}M`);
+    overlay.handleInput(`\x1b[<32;2;${transcriptRow}M`);
     expect(overlay.getSelectedTranscriptText()).toBe(" You  selec");
 
-    overlay.handleInput("\x1b[<0;26;6M");
-    overlay.handleInput("\x1b[<32;25;6M");
+    overlay.handleInput(`\x1b[<0;16;${transcriptRow}M`);
+    overlay.handleInput(`\x1b[<32;15;${transcriptRow}M`);
     expect(overlay.getSelectedTranscriptText()).toBe("中");
-    overlay.handleInput("\x1b[<0;25;6m");
+    overlay.handleInput(`\x1b[<0;15;${transcriptRow}m`);
     await flushAsyncWork();
     expect(copyToClipboardMock).toHaveBeenLastCalledWith("中");
     expect(overlay.hintsText.text).toContain("Copied 1 character");
 
-    overlay.handleInput("\x1b[<0;12;6M");
-    overlay.handleInput("\x1b[<0;12;6m");
+    overlay.handleInput(`\x1b[<0;2;${transcriptRow}M`);
+    overlay.handleInput(`\x1b[<0;2;${transcriptRow}m`);
     expect(overlay.hintsText.text).not.toContain("Copied");
   });
 
@@ -1771,10 +1915,11 @@ describe("btw runtime behavior", () => {
 
     const overlay = harness.latestOverlayComponent();
     overlay.render(80);
-    overlay.handleInput("\x1b[<0;25;6M");
-    overlay.handleInput("\x1b[<32;26;6M");
+    const transcriptRow = 5;
+    overlay.handleInput(`\x1b[<0;15;${transcriptRow}M`);
+    overlay.handleInput(`\x1b[<32;16;${transcriptRow}M`);
     expect(overlay.getSelectedTranscriptText()).toBe("😀");
-    overlay.handleInput("\x1b[<0;26;6m");
+    overlay.handleInput(`\x1b[<0;16;${transcriptRow}m`);
     await flushAsyncWork();
 
     expect(copyToClipboardMock).toHaveBeenLastCalledWith("😀");
@@ -2449,14 +2594,7 @@ describe("btw runtime behavior", () => {
     expect(inputLine.endsWith("│")).toBe(true);
   });
 
-  describe("overlay render height vs maxHeight", () => {
-    function resolveOverlayMaxHeight(rows: number): number {
-      const marginTop = 1;
-      const availHeight = Math.max(1, rows - marginTop);
-      const parsed = Math.floor((rows * 78) / 100);
-      return Math.max(1, Math.min(parsed, availHeight));
-    }
-
+  describe("fullscreen overlay render height", () => {
     function withStdoutRows(rows: number): { restore: () => void } {
       const stdout = process.stdout as NodeJS.WriteStream & { rows?: number };
       const descriptor = Object.getOwnPropertyDescriptor(stdout, "rows");
@@ -2480,9 +2618,9 @@ describe("btw runtime behavior", () => {
           await harness.runSessionStart();
           await harness.command("btw", "");
           const overlay = harness.latestOverlayComponent();
+          harness.tui.terminal.rows = rows;
           const lines = overlay.render(80) as string[];
-          const maxHeight = resolveOverlayMaxHeight(rows);
-          expect(lines.length).toBeLessThanOrEqual(maxHeight);
+          expect(lines.length).toBe(rows);
           expect(lines.at(-1)).toMatch(/└/);
         } finally {
           restore();

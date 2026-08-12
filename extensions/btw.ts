@@ -21,6 +21,7 @@ import {
   Key,
   Markdown,
   Text,
+  isViewportTUI,
   matchesKey,
   truncateToWidth,
   visibleWidth,
@@ -152,6 +153,7 @@ type BtwTranscriptSelectionPoint = {
 
 type BtwTranscriptState = {
   entries: BtwTranscript;
+  revision: number;
   nextEntryId: number;
   nextTurnId: number;
   currentTurnId: number | null;
@@ -172,6 +174,8 @@ type OverlayRuntime = {
   close?: () => void;
   finish?: () => void;
   setDraft?: (value: string) => void;
+  streamRefreshTimer?: ReturnType<typeof setTimeout>;
+  streamRefreshPending?: boolean;
   closed?: boolean;
 };
 
@@ -421,6 +425,7 @@ function formatToolPreview(value: unknown): string {
 function createEmptyTranscriptState(): BtwTranscriptState {
   return {
     entries: [],
+    revision: 0,
     nextEntryId: 1,
     nextTurnId: 1,
     currentTurnId: null,
@@ -435,6 +440,7 @@ function appendTranscriptEntry<T extends BtwTranscriptEntry>(
 ): T {
   const nextEntry = { ...entry, id: state.nextEntryId++ } as T;
   state.entries.push(nextEntry);
+  state.revision++;
   return nextEntry;
 }
 
@@ -463,19 +469,31 @@ function finishTranscriptTurn(state: BtwTranscriptState, turnId?: number | null)
     appendTranscriptEntry(state, { type: "turn-boundary", turnId: resolvedTurnId, phase: "end" } as Omit<Extract<BtwTranscriptEntry, { type: "turn-boundary" }>, "id">);
   }
 
+  let changed = false;
   for (const entry of state.entries) {
     if (entry.turnId !== resolvedTurnId) {
       continue;
     }
 
-    if (entry.type === "thinking" || entry.type === "assistant-text" || entry.type === "tool-result") {
+    if (
+      (entry.type === "thinking" || entry.type === "assistant-text" || entry.type === "tool-result") &&
+      entry.streaming
+    ) {
       entry.streaming = false;
+      changed = true;
     }
   }
 
-  state.lastTurnId = resolvedTurnId;
+  if (state.lastTurnId !== resolvedTurnId) {
+    state.lastTurnId = resolvedTurnId;
+    changed = true;
+  }
   if (state.currentTurnId === resolvedTurnId) {
     state.currentTurnId = null;
+    changed = true;
+  }
+  if (changed) {
+    state.revision++;
   }
 }
 
@@ -497,6 +515,7 @@ function removeTranscriptTurn(state: BtwTranscriptState, turnId: number | null):
   if (state.lastTurnId === turnId) {
     state.lastTurnId = null;
   }
+  state.revision++;
 }
 
 function findLatestTranscriptEntry<TType extends BtwTranscriptEntry["type"]>(
@@ -546,7 +565,10 @@ function upsertUserMessageEntry(state: BtwTranscriptState, turnId: number, text:
 
   const existing = findLatestTranscriptEntry(state, turnId, "user-message");
   if (existing) {
-    existing.text = text;
+    if (existing.text !== text) {
+      existing.text = text;
+      state.revision++;
+    }
     return;
   }
 
@@ -566,8 +588,11 @@ function upsertTranscriptTextEntry(
 
   const existing = findLatestTranscriptEntry(state, turnId, type);
   if (existing) {
-    existing.text = text;
-    existing.streaming = streaming;
+    if (existing.text !== text || existing.streaming !== streaming) {
+      existing.text = text;
+      existing.streaming = streaming;
+      state.revision++;
+    }
     return;
   }
 
@@ -665,10 +690,18 @@ function upsertToolResultEntry(
       : undefined;
 
   if (existing && existing.type === "tool-result") {
-    existing.content = content;
-    existing.truncated = truncated;
-    existing.isError = isError;
-    existing.streaming = streaming;
+    if (
+      existing.content !== content ||
+      existing.truncated !== truncated ||
+      existing.isError !== isError ||
+      existing.streaming !== streaming
+    ) {
+      existing.content = content;
+      existing.truncated = truncated;
+      existing.isError = isError;
+      existing.streaming = streaming;
+      state.revision++;
+    }
     return;
   }
 
@@ -843,11 +876,26 @@ function buildMarkdownTheme(theme: ExtensionContext["ui"]["theme"]): MarkdownThe
   };
 }
 
+type BtwMarkdownRenderCacheEntry = {
+  type: "thinking" | "assistant-text";
+  text: string;
+  contentWidth: number;
+  lines: string[];
+};
+
+type BtwWrappedLineCacheEntry = {
+  source: string;
+  innerWidth: number;
+  lines: string[];
+  plainLines: string[];
+};
+
 function buildOverlayTranscript(
   entries: BtwTranscript,
   theme: ExtensionContext["ui"]["theme"],
   markdownTheme: MarkdownTheme,
   contentWidth: number,
+  markdownCache: Map<number, BtwMarkdownRenderCacheEntry>,
 ): string[] {
   if (entries.length === 0) {
     return [theme.fg("dim", "No BTW thread yet. Ask a side question to start one.")];
@@ -920,17 +968,31 @@ function buildOverlayTranscript(
 
     if (entry.type === "thinking") {
       const thinkingHeader = entry.streaming ? `${thinkingBadge} ${theme.fg("warning", "▍")}` : thinkingBadge;
-      // Render reasoning as markdown (matching the main agent) while keeping the BTW
-      // overlay's amber thinking look via a warning-colored italic default text style.
-      const markdownLines = new Markdown(entry.text, 0, 0, markdownTheme, {
-        color: (text: string) => theme.fg("warning", text),
-        italic: true,
-      })
-        .render(Math.max(1, contentWidth))
-        .map((line) => line.replace(/\s+$/u, ""));
+      // Keep one bounded cache record per transcript entry. Completed history is reused
+      // across streaming frames instead of being reparsed for every token update.
+      let cached = markdownCache.get(entry.id);
+      if (
+        !cached ||
+        cached.type !== entry.type ||
+        cached.text !== entry.text ||
+        cached.contentWidth !== contentWidth
+      ) {
+        cached = {
+          type: entry.type,
+          text: entry.text,
+          contentWidth,
+          lines: new Markdown(entry.text, 0, 0, markdownTheme, {
+            color: (text: string) => theme.fg("warning", text),
+            italic: true,
+          })
+            .render(Math.max(1, contentWidth))
+            .map((line) => line.replace(/\s+$/u, "")),
+        };
+        markdownCache.set(entry.id, cached);
+      }
       pushBlankLine();
       lines.push(thinkingHeader);
-      for (const line of markdownLines) {
+      for (const line of cached.lines) {
         lines.push(line ? `${blockIndent}${line}` : "");
       }
       continue;
@@ -960,14 +1022,26 @@ function buildOverlayTranscript(
 
     if (entry.type === "assistant-text") {
       const assistantHeader = entry.streaming ? `${assistantBadge} ${theme.fg("warning", "▍")}` : assistantBadge;
-      // Render the assistant response as styled markdown instead of raw text so that
-      // headings, lists, code blocks, tables, and inline formatting are actually parsed.
-      const markdownLines = new Markdown(entry.text, 0, 0, markdownTheme)
-        .render(Math.max(1, contentWidth))
-        .map((line) => line.replace(/\s+$/u, ""));
+      let cached = markdownCache.get(entry.id);
+      if (
+        !cached ||
+        cached.type !== entry.type ||
+        cached.text !== entry.text ||
+        cached.contentWidth !== contentWidth
+      ) {
+        cached = {
+          type: entry.type,
+          text: entry.text,
+          contentWidth,
+          lines: new Markdown(entry.text, 0, 0, markdownTheme)
+            .render(Math.max(1, contentWidth))
+            .map((line) => line.replace(/\s+$/u, "")),
+        };
+        markdownCache.set(entry.id, cached);
+      }
       pushBlankLine();
       lines.push(assistantHeader);
-      for (const line of markdownLines) {
+      for (const line of cached.lines) {
         lines.push(line ? `${blockIndent}${line}` : "");
       }
     }
@@ -1098,9 +1172,11 @@ const BTW_ESCAPE_DOUBLE_WINDOW_MS = 500;
 /** Delay before a single Escape (with no input, LLM idle) dismisses the overlay. */
 const BTW_ESCAPE_EXIT_DELAY_MS = 300;
 
+/** Coalesce high-frequency streaming deltas before doing expensive transcript work. */
+const BTW_STREAM_REFRESH_INTERVAL_MS = 32;
 
 const BTW_TRANSCRIPT_START_ROW = 4;
-const BTW_OVERLAY_TOP_MARGIN = 1;
+const BTW_OVERLAY_TOP_MARGIN = 0;
 const BTW_GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 function extractTerminalControlSequence(value: string, index: number): string | null {
@@ -1188,12 +1264,11 @@ function buildTranscriptBadge(
 
 class BtwOverlayComponent extends Container implements Focusable {
   private readonly input: Input;
-  private readonly transcript: Container;
   private readonly statusText: Text;
   private readonly modeText: Text;
   private readonly summaryText: Text;
   private readonly hintsText: Text;
-  private readonly readTranscriptEntries: () => BtwTranscript;
+  private readonly readTranscriptState: () => BtwTranscriptState;
   private readonly getStatus: () => string | null;
   private readonly getMode: () => BtwThreadMode;
   private readonly onSubmitCallback: (value: string) => void;
@@ -1205,21 +1280,28 @@ class BtwOverlayComponent extends Container implements Focusable {
   private readonly tui: TUI;
   private readonly theme: ExtensionContext["ui"]["theme"];
   private readonly markdownTheme: MarkdownTheme;
+  private readonly markdownRenderCache = new Map<number, BtwMarkdownRenderCacheEntry>();
+  private wrappedLineCache: BtwWrappedLineCacheEntry[] = [];
   private transcriptLines: string[] = [];
   private transcriptScrollOffset = 0;
   private transcriptViewportHeight = 8;
-  private contentWidth = 66;
   private followTranscript = true;
   private renderedTranscriptLines: string[] = [];
   private renderedTranscriptPlainLines: string[] = [];
   private renderedTranscriptInnerWidth = 0;
   private renderedDialogWidth = 0;
+  private formattedTranscriptState: BtwTranscriptState | null = null;
+  private formattedTranscriptRevision = -1;
+  private formattedTranscriptContentWidth = -1;
+  private wrappedTranscriptRevision = -1;
+  private wrappedTranscriptInnerWidth = -1;
   private selectionAnchor: BtwTranscriptSelectionPoint | null = null;
   private selectionFocus: BtwTranscriptSelectionPoint | null = null;
   private selectionMoved = false;
   private selectionNotice: string | null = null;
   private selectionCopyGeneration = 0;
   private mouseTrackingEnabled = false;
+  private readonly ownsMouseTracking: boolean;
   private _focused = false;
   private modeTextValue = "";
   private summaryTextValue = "";
@@ -1242,7 +1324,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     tui: TUI,
     theme: ExtensionContext["ui"]["theme"],
     keybindings: KeybindingsManager,
-    readTranscriptEntries: () => BtwTranscript,
+    readTranscriptState: () => BtwTranscriptState,
     getStatus: () => string | null,
     getMode: () => BtwThreadMode,
     getIsStreaming: () => boolean,
@@ -1254,9 +1336,10 @@ class BtwOverlayComponent extends Container implements Focusable {
   ) {
     super();
     this.tui = tui;
+    this.ownsMouseTracking = !isViewportTUI(tui);
     this.theme = theme;
     this.markdownTheme = buildMarkdownTheme(theme);
-    this.readTranscriptEntries = readTranscriptEntries;
+    this.readTranscriptState = readTranscriptState;
     this.getStatus = getStatus;
     this.getMode = getMode;
     this.getIsStreaming = getIsStreaming;
@@ -1268,7 +1351,6 @@ class BtwOverlayComponent extends Container implements Focusable {
 
     this.modeText = new Text("", 1, 0);
     this.summaryText = new Text("", 1, 0);
-    this.transcript = new Container();
     this.statusText = new Text("", 1, 0);
 
     this.input = new Input();
@@ -1352,6 +1434,8 @@ class BtwOverlayComponent extends Container implements Focusable {
         this.onDismissCallback();
         return;
       }
+      this.cancelEscapeExit();
+      this.lastEscapeAt = 0;
       originalHandleInput(data);
     };
 
@@ -1390,21 +1474,74 @@ class BtwOverlayComponent extends Container implements Focusable {
     return this.theme.fg("border", `${left}${"─".repeat(innerWidth)}${right}`);
   }
 
-  private wrapTranscript(innerWidth: number): string[] {
-    const wrapped: string[] = [];
-    for (const line of this.transcriptLines) {
-      if (!line) {
-        wrapped.push("");
-        continue;
-      }
-      wrapped.push(...wrapTextWithAnsi(line, Math.max(1, innerWidth)));
+  private ensureFormattedTranscript(contentWidth: number): void {
+    const state = this.readTranscriptState();
+    if (
+      this.formattedTranscriptState === state &&
+      this.formattedTranscriptRevision === state.revision &&
+      this.formattedTranscriptContentWidth === contentWidth
+    ) {
+      return;
     }
-    return wrapped;
+
+    this.transcriptLines = buildOverlayTranscript(
+      state.entries,
+      this.theme,
+      this.markdownTheme,
+      contentWidth,
+      this.markdownRenderCache,
+    );
+
+    const liveIds = new Set(state.entries.map((entry) => entry.id));
+    for (const id of this.markdownRenderCache.keys()) {
+      if (!liveIds.has(id)) {
+        this.markdownRenderCache.delete(id);
+      }
+    }
+
+    this.formattedTranscriptState = state;
+    this.formattedTranscriptRevision = state.revision;
+    this.formattedTranscriptContentWidth = contentWidth;
+    this.wrappedTranscriptRevision = -1;
+  }
+
+  private ensureWrappedTranscript(innerWidth: number): void {
+    if (
+      this.wrappedTranscriptRevision === this.formattedTranscriptRevision &&
+      this.wrappedTranscriptInnerWidth === innerWidth
+    ) {
+      return;
+    }
+
+    const nextLineCache: BtwWrappedLineCacheEntry[] = [];
+    const wrapped: string[] = [];
+    const plain: string[] = [];
+    for (let i = 0; i < this.transcriptLines.length; i++) {
+      const source = this.transcriptLines[i];
+      let cached = this.wrappedLineCache[i];
+      if (!cached || cached.source !== source || cached.innerWidth !== innerWidth) {
+        const lines = source ? wrapTextWithAnsi(source, Math.max(1, innerWidth)) : [""];
+        cached = {
+          source,
+          innerWidth,
+          lines,
+          plainLines: lines.map((line) => stripVTControlCharacters(line)),
+        };
+      }
+      nextLineCache.push(cached);
+      wrapped.push(...cached.lines);
+      plain.push(...cached.plainLines);
+    }
+
+    this.wrappedLineCache = nextLineCache;
+    this.renderedTranscriptLines = wrapped;
+    this.renderedTranscriptPlainLines = plain;
+    this.wrappedTranscriptRevision = this.formattedTranscriptRevision;
+    this.wrappedTranscriptInnerWidth = innerWidth;
   }
 
   private getDialogHeight(): number {
-    const terminalRows = process.stdout.rows ?? 30;
-    return Math.max(18, Math.min(32, Math.floor(terminalRows * 0.78)));
+    return Math.max(BTW_OVERLAY_CHROME_LINES, this.tui.terminal?.rows ?? process.stdout.rows ?? 30);
   }
 
   private scrollTranscript(delta: number): void {
@@ -1419,6 +1556,19 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.cancelEscapeExit();
     this.selectionCopyGeneration++;
     this.setMouseTrackingEnabled(false);
+    this.markdownRenderCache.clear();
+    this.wrappedLineCache = [];
+  }
+
+  override invalidate(): void {
+    super.invalidate();
+    this.markdownRenderCache.clear();
+    this.wrappedLineCache = [];
+    this.formattedTranscriptState = null;
+    this.formattedTranscriptRevision = -1;
+    this.formattedTranscriptContentWidth = -1;
+    this.wrappedTranscriptRevision = -1;
+    this.wrappedTranscriptInnerWidth = -1;
   }
 
   private setMouseTrackingEnabled(enabled: boolean): void {
@@ -1427,6 +1577,11 @@ class BtwOverlayComponent extends Container implements Focusable {
     }
 
     this.mouseTrackingEnabled = enabled;
+    // Viewport/fullscreen TUI owns the terminal-wide mouse mode already. Avoid
+    // disabling its global selection/wheel tracking when BTW loses focus.
+    if (!this.ownsMouseTracking) {
+      return;
+    }
     // Button-event tracking preserves wheel input and also reports left-button drag motion.
     this.tui.terminal?.write?.(enabled ? "\x1b[?1002h\x1b[?1006h" : "\x1b[?1002l\x1b[?1006l");
   }
@@ -1451,10 +1606,9 @@ class BtwOverlayComponent extends Container implements Focusable {
   }
 
   private getOverlayOrigin(): { row: number; column: number } {
-    const terminalWidth = this.tui.terminal?.columns ?? process.stdout.columns ?? this.renderedDialogWidth;
     return {
       row: BTW_OVERLAY_TOP_MARGIN,
-      column: Math.max(0, Math.floor((terminalWidth - this.renderedDialogWidth) / 2)),
+      column: 0,
     };
   }
 
@@ -1694,6 +1848,8 @@ class BtwOverlayComponent extends Container implements Focusable {
   }
 
   handleInput(data: string): void {
+    this.cancelEscapeExit();
+
     if (matchesBtwFocusShortcut(data)) {
       this.onUnfocusCallback();
       return;
@@ -1735,24 +1891,20 @@ class BtwOverlayComponent extends Container implements Focusable {
   }
 
   override render(width: number): string[] {
-    const dialogWidth = Math.max(24, width);
-    const innerWidth = Math.max(22, dialogWidth - 2);
+    const dialogWidth = Math.max(1, width);
+    const innerWidth = Math.max(1, dialogWidth - 2);
     const contentWidth = Math.max(1, innerWidth - BTW_BLOCK_INDENT.length);
-    if (contentWidth !== this.contentWidth) {
-      this.contentWidth = contentWidth;
-      this.rebuildTranscriptLines();
-    }
-    const transcriptLines = this.wrapTranscript(innerWidth);
+    this.ensureFormattedTranscript(contentWidth);
     if (this.renderedTranscriptInnerWidth !== 0 && this.renderedTranscriptInnerWidth !== innerWidth) {
       this.clearTranscriptSelection();
     }
+    this.ensureWrappedTranscript(innerWidth);
+    const transcriptLines = this.renderedTranscriptLines;
     this.renderedDialogWidth = dialogWidth;
     this.renderedTranscriptInnerWidth = innerWidth;
-    this.renderedTranscriptLines = transcriptLines;
-    this.renderedTranscriptPlainLines = transcriptLines.map((line) => stripVTControlCharacters(line));
     const dialogHeight = this.getDialogHeight();
     const chromeHeight = BTW_OVERLAY_CHROME_LINES;
-    const transcriptHeight = Math.max(6, dialogHeight - chromeHeight);
+    const transcriptHeight = Math.max(0, dialogHeight - chromeHeight);
     this.transcriptViewportHeight = transcriptHeight;
 
     const maxScroll = Math.max(0, transcriptLines.length - transcriptHeight);
@@ -1802,9 +1954,11 @@ class BtwOverlayComponent extends Container implements Focusable {
     return lines.map((line) => this.fitRenderedLine(line, width));
   }
 
-  setDraft(value: string): void {
+  setDraft(value: string, requestRender = true): void {
     this.input.setValue(value);
-    this.tui.requestRender();
+    if (requestRender) {
+      this.tui.requestRender();
+    }
   }
 
   getDraft(): string {
@@ -1812,22 +1966,20 @@ class BtwOverlayComponent extends Container implements Focusable {
   }
 
   getTranscriptEntries(): BtwTranscript {
-    return this.readTranscriptEntries().map((entry) => ({ ...entry }));
+    return this.readTranscriptState().entries.map((entry) => ({ ...entry }));
   }
 
-  private rebuildTranscriptLines(): void {
-    this.transcriptLines = buildOverlayTranscript(
-      this.readTranscriptEntries(),
-      this.theme,
-      this.markdownTheme,
-      this.contentWidth,
-    );
+  getTranscriptLines(): string[] {
+    const innerWidth = Math.max(1, this.renderedTranscriptInnerWidth || (this.tui.terminal?.columns ?? 80) - 2);
+    const contentWidth = Math.max(1, innerWidth - BTW_BLOCK_INDENT.length);
+    this.ensureFormattedTranscript(contentWidth);
+    return [...this.transcriptLines];
   }
 
   refresh(): void {
     this.modeTextValue = `${getOverlayTitle(this.getMode())} · hidden thread preserved`;
     this.modeText.setText(this.modeTextValue);
-    const entries = this.readTranscriptEntries();
+    const entries = this.readTranscriptState().entries;
     if (entries.length === 0) {
       this.clearTranscriptSelection();
     }
@@ -1835,12 +1987,6 @@ class BtwOverlayComponent extends Container implements Focusable {
     const active = hasStreamingTranscriptEntry(entries) ? " · streaming" : " · idle";
     this.summaryTextValue = `${exchanges} exchange${exchanges === 1 ? "" : "s"}${active}`;
     this.summaryText.setText(this.summaryTextValue);
-
-    this.rebuildTranscriptLines();
-    this.transcript.clear();
-    for (const line of this.transcriptLines) {
-      this.transcript.addChild(new Text(line, 1, 0));
-    }
 
     const status = this.getStatus() ?? "Ready. Enter submits; Escape dismisses without clearing.";
     this.statusTextValue = status;
@@ -1860,20 +2006,66 @@ export default function (pi: ExtensionAPI) {
   let overlayStatus: string | null = null;
   let overlayDraft = "";
   let overlayRuntime: OverlayRuntime | null = null;
-  let lastUiContext: ExtensionContext | ExtensionCommandContext | null = null;
   let activeBtwSession: BtwSessionRuntime | null = null;
 
-  function syncUi(ctx?: ExtensionContext | ExtensionCommandContext): void {
-    const activeCtx = ctx ?? lastUiContext;
-    if (activeCtx?.hasUI) {
-      activeCtx.ui.setWidget("btw", undefined);
-      overlayRuntime?.refresh?.();
+  function cancelScheduledUiSync(runtime: OverlayRuntime | null = overlayRuntime): void {
+    if (runtime?.streamRefreshTimer) {
+      clearTimeout(runtime.streamRefreshTimer);
+      runtime.streamRefreshTimer = undefined;
+    }
+    if (runtime) {
+      runtime.streamRefreshPending = false;
     }
   }
 
-  function setOverlayStatus(status: string | null, ctx?: ExtensionContext | ExtensionCommandContext): void {
+  function syncUi(_ctx?: ExtensionContext | ExtensionCommandContext): void {
+    const runtime = overlayRuntime;
+    if (!runtime || runtime.closed) {
+      return;
+    }
+
+    cancelScheduledUiSync(runtime);
+    if (runtime.handle?.isHidden()) {
+      runtime.streamRefreshPending = true;
+      return;
+    }
+
+    runtime.streamRefreshPending = false;
+    runtime.refresh?.();
+  }
+
+  function scheduleUiSync(_ctx?: ExtensionContext | ExtensionCommandContext): void {
+    const runtime = overlayRuntime;
+    if (!runtime || runtime.closed) {
+      return;
+    }
+
+    runtime.streamRefreshPending = true;
+    if (runtime.handle?.isHidden() || runtime.streamRefreshTimer) {
+      return;
+    }
+
+    runtime.streamRefreshTimer = setTimeout(() => {
+      runtime.streamRefreshTimer = undefined;
+      if (runtime.closed || overlayRuntime !== runtime || runtime.handle?.isHidden()) {
+        return;
+      }
+      runtime.streamRefreshPending = false;
+      runtime.refresh?.();
+    }, BTW_STREAM_REFRESH_INTERVAL_MS);
+  }
+
+  function setOverlayStatus(
+    status: string | null,
+    ctx?: ExtensionContext | ExtensionCommandContext,
+    streaming = false,
+  ): void {
     overlayStatus = status;
-    syncUi(ctx);
+    if (streaming) {
+      scheduleUiSync(ctx);
+    } else {
+      syncUi(ctx);
+    }
   }
 
   function setOverlayDraft(value: string): void {
@@ -1882,6 +2074,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function dismissOverlay(): void {
+    cancelScheduledUiSync();
     overlayRuntime?.close?.();
     overlayRuntime = null;
   }
@@ -1892,8 +2085,9 @@ export default function (pi: ExtensionAPI) {
    * shortcut again brings the panel back with focus restored.
    */
   function toggleOverlayFocus(): void {
-    const handle = overlayRuntime?.handle;
-    if (!handle) {
+    const runtime = overlayRuntime;
+    const handle = runtime?.handle;
+    if (!runtime || !handle) {
       return;
     }
 
@@ -1901,11 +2095,14 @@ export default function (pi: ExtensionAPI) {
       handle.setHidden(false);
       // The BTW overlay is nonCapturing, so showing it does not auto-focus.
       handle.focus();
+      syncUi();
     } else {
+      cancelScheduledUiSync(runtime);
       handle.setHidden(true);
       handle.unfocus();
+      runtime.streamRefreshPending = true;
+      runtime.refresh?.();
     }
-    overlayRuntime?.refresh?.();
   }
 
   function focusOverlay(): void {
@@ -1916,7 +2113,7 @@ export default function (pi: ExtensionAPI) {
 
     handle.setHidden(false);
     handle.focus();
-    overlayRuntime?.refresh?.();
+    syncUi();
   }
 
   function removeBtwSessionSubscription(sessionRuntime: BtwSessionRuntime, unsubscribe: () => void): void {
@@ -1946,10 +2143,19 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    const previousRevision = transcriptState.revision;
     applyTranscriptEvent(transcriptState, event);
+    const transcriptChanged = transcriptState.revision !== previousRevision;
 
     if (event.type === "tool_execution_start") {
       setOverlayStatus(`⏳ running tool: ${event.toolName}`, ctx);
+      return;
+    }
+
+    if (event.type === "tool_execution_update") {
+      if (transcriptChanged) {
+        scheduleUiSync(ctx);
+      }
       return;
     }
 
@@ -1963,13 +2169,17 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    if (
-      event.type === "message_start" ||
-      event.type === "message_update" ||
-      event.type === "message_end" ||
-      event.type === "turn_start"
-    ) {
-      syncUi(ctx);
+    if (event.type === "message_update") {
+      if (transcriptChanged) {
+        scheduleUiSync(ctx);
+      }
+      return;
+    }
+
+    if (event.type === "message_start" || event.type === "message_end" || event.type === "turn_start") {
+      if (transcriptChanged || event.type !== "message_start") {
+        syncUi(ctx);
+      }
     }
   }
 
@@ -2161,7 +2371,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     const sessionOptions = {
-      sessionManager: SessionManager.inMemory(),
+      cwd: ctx.cwd,
+      sessionManager: SessionManager.inMemory(ctx.cwd),
       model: settings.model,
       ...getSessionModelOptions(ctx),
       thinkingLevel: settings.thinkingLevel,
@@ -2195,11 +2406,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function ensureOverlay(ctx: ExtensionCommandContext | ExtensionContext): Promise<void> {
-    if (!ctx.hasUI) {
+    if (!ctx.hasUI || ctx.mode !== "tui") {
       return;
     }
-    lastUiContext = ctx;
-
     if (overlayRuntime?.handle) {
       subscribeOverlayToActiveBtwSession(ctx);
       focusOverlay();
@@ -2212,10 +2421,12 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       runtime.closed = true;
+      cancelScheduledUiSync(runtime);
       if (activeBtwSession) {
         clearBtwSessionSubscriptions(activeBtwSession);
       }
-      runtime.handle?.hide();
+      // `done()` owns overlay removal through Pi's custom-UI lifecycle. Calling the
+      // handle's precise hide first would make `done()` pop a different stacked overlay.
       if (overlayRuntime === runtime) {
         overlayRuntime = null;
       }
@@ -2236,7 +2447,7 @@ export default function (pi: ExtensionAPI) {
             tui,
             theme,
             keybindings,
-            () => transcriptState.entries,
+            () => transcriptState,
             () => overlayStatus,
             () => pendingMode,
             () => activeBtwSession?.session.isStreaming ?? false,
@@ -2251,10 +2462,14 @@ export default function (pi: ExtensionAPI) {
               // main session is visible again (focus returns to the main editor).
               const handle = overlayRuntime?.handle;
               if (handle) {
+                cancelScheduledUiSync();
                 handle.setHidden(true);
                 handle.unfocus();
+                if (overlayRuntime) {
+                  overlayRuntime.streamRefreshPending = true;
+                  overlayRuntime.refresh?.();
+                }
               }
-              overlayRuntime?.refresh?.();
             },
             () => {
               void abortActiveBtwRequest(ctx);
@@ -2267,10 +2482,17 @@ export default function (pi: ExtensionAPI) {
           overlay.focused = runtime.handle?.isFocused() ?? true;
           overlay.setDraft(overlayDraft);
           runtime.setDraft = (value) => {
-            overlay.setDraft(value);
+            overlay.setDraft(value, !runtime.handle?.isHidden());
           };
           runtime.refresh = () => {
+            if (runtime.closed) {
+              return;
+            }
             overlay.focused = runtime.handle?.isFocused() ?? false;
+            if (runtime.handle?.isHidden()) {
+              runtime.streamRefreshPending = true;
+              return;
+            }
             overlay.refresh();
           };
           runtime.close = () => {
@@ -2290,11 +2512,10 @@ export default function (pi: ExtensionAPI) {
         {
           overlay: true,
           overlayOptions: {
-            width: "78%",
-            minWidth: 72,
-            maxHeight: "78%",
-            anchor: "top-center",
-            margin: { top: 1, left: 2, right: 2 },
+            width: "100%",
+            maxHeight: "100%",
+            anchor: "top-left",
+            margin: 0,
             nonCapturing: true,
           },
           onHandle: (handle) => {
@@ -2307,6 +2528,7 @@ export default function (pi: ExtensionAPI) {
         },
       )
       .catch((error) => {
+        cancelScheduledUiSync(runtime);
         if (overlayRuntime === runtime) {
           overlayRuntime = null;
         }
@@ -2511,7 +2733,6 @@ export default function (pi: ExtensionAPI) {
 
     setOverlayDraft("");
     setOverlayStatus("⏳ streaming...", ctx);
-    syncUi(ctx);
     await runBtw(cmdCtx, question, false, pendingMode);
   }
 
@@ -2548,7 +2769,6 @@ export default function (pi: ExtensionAPI) {
     }
 
     setOverlayStatus("Rewound the last message. Thread preserved.", ctx);
-    syncUi(ctx);
   }
 
   async function resetThread(
@@ -2566,7 +2786,6 @@ export default function (pi: ExtensionAPI) {
       const details: BtwResetDetails = { timestamp: Date.now(), mode };
       pi.appendEntry(BTW_RESET_TYPE, details);
     }
-    syncUi(ctx);
   }
 
   async function restoreThread(ctx: ExtensionContext): Promise<void> {
@@ -2577,7 +2796,6 @@ export default function (pi: ExtensionAPI) {
     btwThinkingOverride = null;
     transcriptState = createEmptyTranscriptState();
     overlayDraft = "";
-    lastUiContext = ctx;
     overlayStatus = null;
 
     const branch = ctx.sessionManager.getBranch();
@@ -2644,7 +2862,6 @@ export default function (pi: ExtensionAPI) {
     saveRequested: boolean,
     mode: BtwThreadMode,
   ): Promise<void> {
-    lastUiContext = ctx;
     const settings = await resolveBtwSettings(ctx);
     const model = settings.model;
     if (!model) {
@@ -2675,7 +2892,7 @@ export default function (pi: ExtensionAPI) {
     pendingMode = mode;
     const thinkingLevel = settings.thinkingLevel;
 
-    setOverlayStatus("⏳ streaming...", ctx);
+    setOverlayStatus("⏳ streaming...", ctx, true);
     await ensureOverlay(ctx);
 
     try {
@@ -2767,7 +2984,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     const sessionOptions = {
-      sessionManager: SessionManager.inMemory(),
+      cwd: ctx.cwd,
+      sessionManager: SessionManager.inMemory(ctx.cwd),
       model,
       ...getSessionModelOptions(ctx),
       thinkingLevel: "off",
@@ -2867,8 +3085,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    await disposeBtwSession();
+    // Release focus, timers, clipboard callbacks, and terminal mouse state before
+    // waiting for a provider/tool abort that may take time to settle.
     dismissOverlay();
+    await disposeBtwSession();
   });
 
   for (const shortcut of BTW_FOCUS_SHORTCUTS) {

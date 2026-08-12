@@ -12,7 +12,8 @@ A maintained fork of [pi-btw](https://github.com/dbachelder/pi-btw) that adds mo
 - runs that side conversation as a real pi sub-session with `read` / `bash` / `edit` / `write` tool access
 - keeps a continuous BTW thread by default
 - supports `/btw:tangent` for a contextless side thread that does not inherit the current main-session conversation
-- opens or refreshes a focused BTW modal shell with its own composer and transcript
+- opens or refreshes a focused fullscreen BTW workspace with its own composer and transcript
+- coalesces streaming UI updates and caches rendered history for smooth long responses
 - supports mouse drag selection in the transcript and copies the selection on release
 - renders assistant replies, thinking blocks, and saved notes as markdown (headings, bold, lists, code blocks, tables, and `---` rules) instead of raw syntax
 - hides/shows the BTW panel with `Ctrl+/` so the main session is not covered
@@ -64,8 +65,8 @@ pi install /absolute/path/to/pi-btw
 - works while pi is busy
 - creates or reuses a real BTW sub-session instead of a one-off completion call
 - continues the current BTW thread
-- opens or refreshes the focused BTW modal shell
-- streams into the BTW modal transcript/status surface
+- opens or refreshes the focused fullscreen BTW workspace
+- streams into the BTW transcript/status surface with coalesced UI refreshes
 - persists the BTW exchange as hidden thread state
 - with `--save`, also saves that single exchange as a visible session note
 
@@ -85,21 +86,21 @@ pi install /absolute/path/to/pi-btw
 - `Ctrl+/` toggles the BTW panel visibility: it hides the panel (focus returns to the main editor
   so the main session is no longer covered), and pressing it again brings the panel back with focus restored
 - `Ctrl+Alt+W` is a fallback visibility toggle for terminals that do not deliver `Ctrl+/` as a usable shortcut
-- BTW now opens top-centered so the main session remains visible underneath it
+- BTW opens fullscreen for maximum transcript space; use `Ctrl+/` to hide it and return to the main session
 
 ### `/btw:new [question]`
 
 - clears the current BTW thread
 - starts a fresh thread that still inherits the current main-session context
 - optionally asks the first question in the new thread immediately
-- if no question is provided, opens a fresh BTW modal ready for the next prompt
+- if no question is provided, opens a fresh fullscreen BTW workspace ready for the next prompt
 
 ### `/btw:tangent [--save] <question>`
 
 - starts or continues a contextless tangent thread
 - does not inherit the current main-session conversation
 - if you switch from `/btw` to `/btw:tangent` (or back), the previous side thread is cleared so the modes do not mix
-- opens or refreshes the same focused BTW modal shell
+- opens or refreshes the same focused fullscreen BTW workspace
 - with `--save`, also saves that single exchange as a visible session note
 
 ### `/btw:clear`
@@ -166,7 +167,7 @@ This keeps BTW-owned lifecycle commands explicit while giving the side conversat
 BTW exchanges are persisted in the session as hidden custom entries so they:
 
 - survive reloads and restarts
-- rehydrate the BTW modal shell for the current branch
+- rehydrate the BTW fullscreen workspace for the current branch
 - preserve whether the current side thread is a normal `/btw` thread or a contextless `/btw:tangent`
 - preserve the current BTW-only model and thinking overrides for that session history
 - stay out of the main agent's LLM context
