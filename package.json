@@ -1,6 +1,6 @@
 {
   "name": "@ppf10083/pi-btw",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "description": "A pi extension for parallel side conversations with mouse-selectable transcripts",
   "type": "module",
   "license": "MIT",
